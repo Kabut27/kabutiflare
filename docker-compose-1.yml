@@ -1,0 +1,10 @@
+version: "3.8"
+
+services:
+  kabutiflare:
+    build: .
+    container_name: kabutiflare
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./users.json:/app/users.json
