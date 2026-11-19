@@ -1,10 +1,15 @@
-version: "3.8"
-
 services:
   kabutiflare:
     build: .
     container_name: kabutiflare
     restart: unless-stopped
     env_file: .env
+    environment:
+      DATA_DIR: /app/data
     volumes:
-      - ./users.json:/app/users.json
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
