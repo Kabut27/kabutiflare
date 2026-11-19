@@ -58,7 +58,6 @@ GITHUB_REPO = "https://raw.githubusercontent.com/Kabut27/kabutiflare/main"
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is required. Set via environment variable or .env file.")
 
-# Brand divider used across messages for a consistent, polished look
 DIV = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
 
 
@@ -103,7 +102,7 @@ DEP_HOST, DEP_PORT, DEP_USER, DEP_AUTH, DEP_PASS, DEP_KEY, DEP_BOTTOKEN, DEP_WEB
 EM_FROM, EM_TO = 200, 201
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  USER DATABASE (persistent JSON with atomic writes)
+#  USER DATABASE (Docker-safe direct write)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def load_db():
     try:
@@ -120,10 +119,9 @@ def load_db():
 
 
 def save_db(db):
-    tmp = f"{DB_FILE}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    # Write in-place so Docker single-file bind mounts (./users.json:/app/users.json) never raise EBUSY
+    with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DB_FILE)
 
 
 def track_user(uid, name="", username=""):
@@ -318,7 +316,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     name = update.effective_user.first_name or "there"
     username = update.effective_user.username or ""
-    track_user(uid, name, username)
+    try:
+        track_user(uid, name, username)
+    except Exception as e:
+        logger.error(f"track_user error: {e}")
+
     logged = bool(get_s(uid).get("key"))
 
     text = (
@@ -350,6 +352,15 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]
 
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
+
+
+async def cancel_and_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Cancel any active conversation and immediately open the /start menu."""
+    for k in list(ctx.user_data.keys()):
+        if k.startswith("dep_"):
+            ctx.user_data.pop(k, None)
+    await cmd_start(update, ctx)
+    return ConversationHandler.END
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -489,7 +500,11 @@ async def connect_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             cf_get(uid, "/zones", {"per_page": 1})
 
-        track_cf_login(uid, update.effective_user.first_name or "")
+        try:
+            track_cf_login(uid, update.effective_user.first_name or "")
+        except Exception as db_err:
+            logger.error(f"track_cf_login error: {db_err}")
+
         _btns = [[InlineKeyboardButton("🌐 View My Domains", callback_data="do_domains")]]
         if WEBAPP_URL:
             _btns.append([webapp_btn("📊 Open Dashboard")])
@@ -2711,8 +2726,8 @@ def main():
             DEP_WEBAPP: [MessageHandler(filters.TEXT & ~filters.COMMAND, deploy_webapp)],
         },
         fallbacks=[
+            CommandHandler("start", cancel_and_start),
             CommandHandler("cancel", deploy_cancel),
-            CommandHandler("start", cmd_start),
         ],
         per_chat=True,
         per_user=True,
@@ -2732,6 +2747,7 @@ def main():
             CONNECT_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_key)],
         },
         fallbacks=[
+            CommandHandler("start", cancel_and_start),
             CommandHandler("cancel", connect_cancel_msg),
             MessageHandler(filters.COMMAND, connect_cancel_msg),
         ],
@@ -2746,7 +2762,10 @@ def main():
             ADD_CONTENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_content)],
             ADD_PROXY: [CallbackQueryHandler(add_proxy, pattern="^px_")],
         },
-        fallbacks=[CommandHandler("cancel", connect_cancel_msg)],
+        fallbacks=[
+            CommandHandler("start", cancel_and_start),
+            CommandHandler("cancel", connect_cancel_msg),
+        ],
         allow_reentry=True,
     )
 
@@ -2755,7 +2774,10 @@ def main():
         states={
             EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_content_value)],
         },
-        fallbacks=[CommandHandler("cancel", connect_cancel_msg)],
+        fallbacks=[
+            CommandHandler("start", cancel_and_start),
+            CommandHandler("cancel", connect_cancel_msg),
+        ],
         allow_reentry=True,
     )
 
@@ -2764,7 +2786,10 @@ def main():
         states={
             BROADCAST_MSG: [MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_send)],
         },
-        fallbacks=[CommandHandler("cancel", broadcast_cancel)],
+        fallbacks=[
+            CommandHandler("start", cancel_and_start),
+            CommandHandler("cancel", broadcast_cancel),
+        ],
         allow_reentry=True,
     )
 
@@ -2774,7 +2799,10 @@ def main():
             EM_FROM: [MessageHandler(filters.TEXT & ~filters.COMMAND, email_add_from)],
             EM_TO: [MessageHandler(filters.TEXT & ~filters.COMMAND, email_add_to)],
         },
-        fallbacks=[CommandHandler("cancel", connect_cancel_msg)],
+        fallbacks=[
+            CommandHandler("start", cancel_and_start),
+            CommandHandler("cancel", connect_cancel_msg),
+        ],
         allow_reentry=True,
     )
 
