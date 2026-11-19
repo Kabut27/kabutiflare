@@ -5,7 +5,7 @@
 ## ⚡ One-Command Deploy
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Kabut27/kabutiflare/main/install.sh)
+curl -fsSL https://raw.githubusercontent.com/Kabut27/kabutiflare/main/install.sh | bash
 ```
 
 ## ✨ Features
