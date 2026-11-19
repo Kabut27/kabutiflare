@@ -10,7 +10,6 @@ import logging
 import socket
 import requests
 import asyncio
-import io
 from html import escape
 from datetime import datetime, timezone, timedelta
 from functools import wraps
@@ -20,12 +19,6 @@ try:
     load_dotenv()
 except ImportError:
     pass
-
-try:
-    import paramiko
-    HAS_PARAMIKO = True
-except ImportError:
-    HAS_PARAMIKO = False
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -47,15 +40,14 @@ CF_GRAPHQL = "https://api.cloudflare.com/client/v4/graphql"
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "474008580").strip())
 
+# Default: public (any user can use the bot with their own Cloudflare account).
+# Set PRIVATE_MODE=true in .env only if you want to restrict to ALLOWED_USERS.
+PRIVATE_MODE = os.getenv("PRIVATE_MODE", "false").strip().lower() in ("1", "true", "yes")
 _raw_allowed = os.getenv("ALLOWED_USERS", "").strip()
-if _raw_allowed:
-    ALLOWED_USERS = {int(x.strip()) for x in _raw_allowed.split(",") if x.strip().isdigit()}
-else:
-    ALLOWED_USERS = {ADMIN_ID}
-ALLOWED_USERS.add(ADMIN_ID)  # Admin always has access
+ALLOWED_USERS = {int(x.strip()) for x in _raw_allowed.split(",") if x.strip().isdigit()}
+ALLOWED_USERS.add(ADMIN_ID)
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
-GITHUB_REPO = "https://raw.githubusercontent.com/Kabut27/kabutiflare/main"
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is required. Set via environment variable or .env file.")
@@ -99,9 +91,6 @@ CONNECT_METHOD, CONNECT_EMAIL, CONNECT_KEY = 0, 1, 2
 ADD_TYPE, ADD_NAME, ADD_CONTENT, ADD_PROXY = 10, 11, 12, 13
 EDIT_VALUE = 50
 BROADCAST_MSG = 60
-DEP_HOST, DEP_PORT, DEP_USER, DEP_AUTH, DEP_PASS, DEP_KEY, DEP_BOTTOKEN, DEP_WEBAPP = (
-    90, 91, 92, 93, 94, 95, 96, 97
-)
 EM_FROM, EM_TO = 200, 201
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -115,9 +104,7 @@ def load_db():
         db = {}
     db.setdefault("users", {})
     db.setdefault("cf_logins", {})
-    db.setdefault("deploy_allowed", [ADMIN_ID])
-    if ADMIN_ID not in db["deploy_allowed"]:
-        db["deploy_allowed"].append(ADMIN_ID)
+    db.setdefault("banned_users", [])
     return db
 
 
@@ -159,26 +146,27 @@ def is_admin(uid):
     return uid == ADMIN_ID
 
 
-def get_deploy_allowed() -> set:
-    return set(load_db().get("deploy_allowed", [ADMIN_ID]))
+def get_banned_users() -> set:
+    return set(load_db().get("banned_users", []))
 
 
-def has_deploy_access(uid) -> bool:
-    return uid == ADMIN_ID or uid in get_deploy_allowed()
+def is_banned(uid) -> bool:
+    return uid != ADMIN_ID and uid in get_banned_users()
 
 
-def grant_deploy(uid):
-    db = load_db()
-    if uid not in db["deploy_allowed"]:
-        db["deploy_allowed"].append(uid)
-        save_db(db)
-
-
-def revoke_deploy(uid):
+def ban_user(uid):
     if uid == ADMIN_ID:
         return
     db = load_db()
-    db["deploy_allowed"] = [u for u in db["deploy_allowed"] if u != uid]
+    if uid not in db["banned_users"]:
+        db["banned_users"].append(uid)
+        save_db(db)
+    del_s(uid)
+
+
+def unban_user(uid):
+    db = load_db()
+    db["banned_users"] = [u for u in db["banned_users"] if u != uid]
     save_db(db)
 
 
@@ -276,12 +264,20 @@ async def acf_patch(uid, path, body):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  AUTH GUARD
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def allowed_only(func):
-    """Block any user who is not in ALLOWED_USERS."""
+def _is_blocked(uid: int) -> bool:
+    if is_banned(uid):
+        return True
+    if PRIVATE_MODE and uid not in ALLOWED_USERS:
+        return True
+    return False
+
+
+def check_access(func):
+    """Allow all non-banned users (unless PRIVATE_MODE=true)."""
     @wraps(func)
     async def w(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        if not user or user.id not in ALLOWED_USERS:
+        if not user or _is_blocked(user.id):
             if update.callback_query:
                 await update.callback_query.answer("⛔ Access denied.", show_alert=True)
             elif update.message:
@@ -295,11 +291,11 @@ def allowed_only(func):
 
 
 def need_auth(func):
-    """Require user to be in ALLOWED_USERS AND connected to Cloudflare."""
+    """Require user to have access AND be connected to Cloudflare."""
     @wraps(func)
     async def w(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        if not user or user.id not in ALLOWED_USERS:
+        if not user or _is_blocked(user.id):
             if update.callback_query:
                 await update.callback_query.answer("⛔ Access denied.", show_alert=True)
             elif update.message:
@@ -327,7 +323,7 @@ def need_auth(func):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  /start
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-@allowed_only
+@check_access
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     name = update.effective_user.first_name or "there"
@@ -343,7 +339,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"╭─❀ <b>KABUTIFLARE</b> ❀─╮\n"
         f"<i>Cloudflare control, right in Telegram</i>\n"
         f"{DIV}\n\n"
-        f"👋 Welcome back, <b>{h(name)}</b>!\n\n"
+        f"👋 Welcome, <b>{h(name)}</b>!\n\n"
     )
 
     if logged:
@@ -351,7 +347,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         btns = [
             [InlineKeyboardButton("🌐 My Domains", callback_data="do_domains"),
              InlineKeyboardButton("📊 Analytics", callback_data="do_analytics")],
-            [InlineKeyboardButton("🚀 Deploy to Server", callback_data="do_deploy")],
         ]
         if WEBAPP_URL:
             btns.append([webapp_btn("🖥 Open Dashboard")])
@@ -363,7 +358,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text += "🔴 <b>Status:</b> Not connected\n\nConnect your Cloudflare account to get started:"
         btns = [
             [InlineKeyboardButton("🔐 Connect to Cloudflare", callback_data="do_connect")],
-            [InlineKeyboardButton("🚀 Deploy to Server", callback_data="do_deploy")],
             [InlineKeyboardButton("📖 Help", callback_data="do_help")],
         ]
 
@@ -372,9 +366,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_and_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Cancel any active conversation and immediately open the /start menu."""
-    for k in list(ctx.user_data.keys()):
-        if k.startswith("dep_"):
-            ctx.user_data.pop(k, None)
     await cmd_start(update, ctx)
     return ConversationHandler.END
 
@@ -382,7 +373,7 @@ async def cancel_and_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  /help
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-@allowed_only
+@check_access
 async def send_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
     if update.callback_query:
@@ -396,8 +387,7 @@ async def send_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/domains — List your domains\n"
         "/dns — Manage DNS records\n"
         "/analytics — View traffic analytics\n"
-        "/disconnect — Disconnect account\n"
-        "/deploy — Install bot on a server\n\n"
+        "/disconnect — Disconnect account\n\n"
         "🔹 <b>Features</b>\n"
         "📋 DNS — View · Add · Edit · Delete records\n"
         "🔒 SSL/TLS — Switch encryption modes\n"
@@ -433,7 +423,7 @@ async def send_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  /connect
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-@allowed_only
+@check_access
 async def connect_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer()
@@ -517,6 +507,7 @@ async def connect_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await acf_get(uid, "/zones", {"per_page": 1})
 
         try:
+            track_user(uid, update.effective_user.first_name or "", update.effective_user.username or "")
             track_cf_login(uid, update.effective_user.first_name or "")
         except Exception as db_err:
             logger.error(f"track_cf_login error: {db_err}")
@@ -1066,7 +1057,7 @@ async def delete_execute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  /disconnect
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-@allowed_only
+@check_access
 async def cmd_disconnect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
     uid = update.effective_user.id
@@ -1083,7 +1074,7 @@ async def cmd_disconnect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  /stats (admin only)
+#  ADMIN COMMANDS: /stats, /broadcast, /ban, /unban, /banlist
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1094,6 +1085,7 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db = load_db()
     total_users = len(db.get("users", {}))
     total_cf = len(db.get("cf_logins", {}))
+    total_banned = len(db.get("banned_users", []))
     active_sessions = len([u for u in sessions.values() if u.get("key")])
 
     users = db.get("users", {})
@@ -1111,16 +1103,14 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"╭─❀ <b>KABUTIFLARE STATS</b> ❀─╮\n{DIV}\n\n"
         f"👥 Total users: <b>{total_users}</b>\n"
         f"☁️ CF logins: <b>{total_cf}</b>\n"
-        f"🟢 Active sessions: <b>{active_sessions}</b>\n\n"
+        f"🟢 Active sessions: <b>{active_sessions}</b>\n"
+        f"🚫 Banned users: <b>{total_banned}</b>\n\n"
         f"📋 <b>Recent users:</b>\n{recent or '  No users yet.'}\n"
         f"<i>✅ = connected to CF | ❌ = not connected</i>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  /broadcast (admin only)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async def broadcast_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
@@ -1208,138 +1198,64 @@ async def broadcast_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  /grantdeploy, /revokedeploy & /deploylist (admin only)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-async def cmd_grantdeploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin(uid):
+async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Access denied.")
+        return
+    if not ctx.args or not ctx.args[0].isdigit():
         await update.message.reply_text(
-            "⛔ <b>Access denied.</b>\n\nOnly the bot admin can manage deploy permissions.",
+            "⚠️ <b>Usage:</b> <code>/ban USER_ID</code>",
             parse_mode="HTML",
         )
         return
-
-    args = ctx.args
-    if not args or not args[0].isdigit():
-        await update.message.reply_text(
-            "╭─❀ <b>GRANT DEPLOY ACCESS</b> ❀─╮\n"
-            f"{DIV}\n\n"
-            "⚠️ <b>Usage:</b> <code>/grantdeploy USER_ID</code>\n\n"
-            "<i>Example: /grantdeploy 123456789</i>",
-            parse_mode="HTML",
-        )
+    target = int(ctx.args[0])
+    if target == ADMIN_ID:
+        await update.message.reply_text("❌ Cannot ban admin.")
         return
-
-    target_uid = int(args[0])
-    if target_uid not in ALLOWED_USERS:
-        await update.message.reply_text(
-            "╭─❀ <b>GRANT DEPLOY</b> ❀─╮\n"
-            f"{DIV}\n\n"
-            f"⚠️ User <code>{target_uid}</code> is not in ALLOWED_USERS.\n\n"
-            "Only allowed users can receive deploy access.",
-            parse_mode="HTML",
-        )
-        return
-
-    grant_deploy(target_uid)
-    db = load_db()
-    user_info = db.get("users", {}).get(str(target_uid), {})
-    name = h(user_info.get("name", "Unknown"))
-    username = f"@{h(user_info['username'])}" if user_info.get("username") else ""
-
+    ban_user(target)
     await update.message.reply_text(
-        "╭─❀ <b>DEPLOY ACCESS GRANTED</b> ❀─╮\n"
-        f"{DIV}\n\n"
-        f"✅ <b>Success!</b>\n\n"
-        f"👤 User: <b>{name}</b> {username}\n"
-        f"🆔 ID: <code>{target_uid}</code>\n\n"
-        f"🚀 They can now use <b>/deploy</b> to deploy to servers.",
+        f"🚫 User <code>{target}</code> has been banned.",
         parse_mode="HTML",
     )
 
 
-async def cmd_revokedeploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_admin(uid):
+async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Access denied.")
+        return
+    if not ctx.args or not ctx.args[0].isdigit():
         await update.message.reply_text(
-            "⛔ <b>Access denied.</b>\n\nOnly the bot admin can manage deploy permissions.",
+            "⚠️ <b>Usage:</b> <code>/unban USER_ID</code>",
             parse_mode="HTML",
         )
         return
-
-    args = ctx.args
-    if not args or not args[0].isdigit():
-        await update.message.reply_text(
-            "╭─❀ <b>REVOKE DEPLOY ACCESS</b> ❀─╮\n"
-            f"{DIV}\n\n"
-            "⚠️ <b>Usage:</b> <code>/revokedeploy USER_ID</code>\n\n"
-            "<i>Example: /revokedeploy 123456789</i>",
-            parse_mode="HTML",
-        )
-        return
-
-    target_uid = int(args[0])
-    if target_uid == ADMIN_ID:
-        await update.message.reply_text(
-            "╭─❀ <b>REVOKE DEPLOY</b> ❀─╮\n"
-            f"{DIV}\n\n"
-            "❌ <b>Cannot revoke admin's own deploy access.</b>",
-            parse_mode="HTML",
-        )
-        return
-
-    if target_uid not in get_deploy_allowed():
-        await update.message.reply_text(
-            "╭─❀ <b>REVOKE DEPLOY</b> ❀─╮\n"
-            f"{DIV}\n\n"
-            f"⚠️ User <code>{target_uid}</code> doesn't currently have deploy access.",
-            parse_mode="HTML",
-        )
-        return
-
-    revoke_deploy(target_uid)
-    db = load_db()
-    user_info = db.get("users", {}).get(str(target_uid), {})
-    name = h(user_info.get("name", "Unknown"))
-    username = f"@{h(user_info['username'])}" if user_info.get("username") else ""
-
+    target = int(ctx.args[0])
+    unban_user(target)
     await update.message.reply_text(
-        "╭─❀ <b>DEPLOY ACCESS REVOKED</b> ❀─╮\n"
-        f"{DIV}\n\n"
-        f"🚫 <b>Access removed.</b>\n\n"
-        f"👤 User: <b>{name}</b> {username}\n"
-        f"🆔 ID: <code>{target_uid}</code>\n\n"
-        f"They can no longer use <b>/deploy</b>.",
+        f"✅ User <code>{target}</code> has been unbanned.",
         parse_mode="HTML",
     )
 
 
-async def cmd_deploylist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """List all users who currently have deploy access."""
-    uid = update.effective_user.id
-    if not is_admin(uid):
-        await update.message.reply_text("⛔ <b>Access denied.</b>", parse_mode="HTML")
+async def cmd_banlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Access denied.")
         return
-
     db = load_db()
-    deploy_users = sorted(get_deploy_allowed())
+    banned = sorted(get_banned_users())
+    if not banned:
+        await update.message.reply_text("✅ No banned users.")
+        return
     lines = []
-    for dep_uid in deploy_users:
-        user_info = db.get("users", {}).get(str(dep_uid), {})
-        name = h(user_info.get("name", "Unknown"))
-        username = f"@{h(user_info['username'])}" if user_info.get("username") else ""
-        tag = " 👑 Admin" if dep_uid == ADMIN_ID else ""
-        lines.append(f"  • <code>{dep_uid}</code> — <b>{name}</b> {username}{tag}")
-
-    text = (
-        "╭─❀ <b>DEPLOY ACCESS LIST</b> ❀─╮\n"
-        f"{DIV}\n\n"
-        f"🚀 <b>{len(deploy_users)}</b> user(s) with deploy access:\n\n"
-        + ("\n".join(lines) or "  No users.") + "\n\n"
-        "<i>Use /grantdeploy ID or /revokedeploy ID to manage.</i>"
+    for buid in banned:
+        info = db.get("users", {}).get(str(buid), {})
+        name = h(info.get("name", "Unknown"))
+        uname = f"@{h(info['username'])}" if info.get("username") else ""
+        lines.append(f"  • <code>{buid}</code> — <b>{name}</b> {uname}")
+    await update.message.reply_text(
+        f"🚫 <b>Banned Users ({len(banned)})</b>\n{DIV}\n\n" + "\n".join(lines),
+        parse_mode="HTML",
     )
-    await update.message.reply_text(text, parse_mode="HTML")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1490,7 +1406,6 @@ async def zone_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_s(uid)
     zone = s.get("cur_zone", {})
 
-    # Min TLS Version picker: tls_{zid} or tlsset_{zid}_{ver}
     if d.startswith("tlsset_"):
         parts = d.replace("tlsset_", "").rsplit("_", 1)
         zid, ver = parts[0], parts[1]
@@ -1545,7 +1460,6 @@ async def zone_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
         return
 
-    # Binary on/off toggle: zst_{zid}_{idx}
     if d.startswith("zst_"):
         parts = d.replace("zst_", "").rsplit("_", 1)
         zid, idx = parts[0], int(parts[1])
@@ -1585,7 +1499,6 @@ async def zone_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # View all settings in ONE API request
     zid = d.replace("zs_", "")
     wait = await q.message.edit_text("⏳ Fetching zone settings…")
     try:
@@ -1711,7 +1624,6 @@ async def workers_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @need_auth
 async def email_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Main email routing screen: status + list of rules."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
@@ -1810,7 +1722,6 @@ async def email_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @need_auth
 async def email_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Step 1 — ask for the source (From) address."""
     q = update.callback_query
     await q.answer()
     zid = q.data.replace("emadd_", "")
@@ -1832,7 +1743,6 @@ async def email_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def email_add_from(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Step 2 — ask for destination (To) address."""
     from_addr = update.message.text.strip().lower()
     if "@" not in from_addr:
         await update.message.reply_text(
@@ -1853,7 +1763,6 @@ async def email_add_from(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def email_add_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Final step — create the rule via Cloudflare API."""
     to_addr = update.message.text.strip().lower()
     if "@" not in to_addr:
         await update.message.reply_text(
@@ -1902,7 +1811,6 @@ async def email_add_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @need_auth
 async def email_toggle_rule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Enable or disable a single email routing rule."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
@@ -1946,7 +1854,6 @@ async def email_toggle_rule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @need_auth
 async def email_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Confirm before deleting a rule."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
@@ -1980,7 +1887,6 @@ async def email_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @need_auth
 async def email_delete_execute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Actually delete the rule."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
@@ -2147,7 +2053,6 @@ def _cf_analytics_zone(uid, zid):
 
 @need_auth
 async def zone_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show analytics for a specific zone (last 24 hours)."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
@@ -2222,7 +2127,6 @@ async def zone_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @need_auth
 async def global_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show a zone picker for analytics."""
     if update.callback_query:
         await update.callback_query.answer()
         msg = update.callback_query.message
@@ -2272,370 +2176,6 @@ async def global_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
     else:
         await msg.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  DEPLOY TO SERVER (via SSH)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DEPLOY_SCRIPT = '''#!/bin/bash
-set -e
-echo "STEP_DOCKER"
-if ! command -v docker &>/dev/null; then
-  curl -fsSL https://get.docker.com | sh >/dev/null 2>&1
-fi
-if ! docker compose version &>/dev/null 2>&1; then
-  apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1 || true
-fi
-echo "STEP_DOWNLOAD"
-mkdir -p /opt/kabutiflare && cd /opt/kabutiflare
-REPO="{repo}"
-curl -fsSL "$REPO/bot.py" -o bot.py
-curl -fsSL "$REPO/Dockerfile" -o Dockerfile
-curl -fsSL "$REPO/docker-compose.yml" -o docker-compose.yml
-curl -fsSL "$REPO/requirements.txt" -o requirements.txt 2>/dev/null || cat > requirements.txt << 'REQEOF'
-python-telegram-bot==21.5
-requests>=2.31.0
-paramiko>=3.0.0
-REQEOF
-echo "STEP_CONFIG"
-cat > .env << ENVEOF
-BOT_TOKEN={bot_token}
-WEBAPP_URL={webapp_url}
-ENVEOF
-[ -f users.json ] || echo '{{"users":{{}},"cf_logins":{{}}}}' > users.json
-echo "STEP_BUILD"
-docker compose down 2>/dev/null || true
-docker compose build --no-cache 2>&1 | tail -8
-echo "STEP_START"
-docker compose up -d
-sleep 2
-echo "STEP_VERIFY"
-docker compose ps
-echo "DEPLOY_OK"
-'''
-
-
-def _ssh_connect(host, port, user, auth_method, password, key_data):
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    connect_args = {
-        "hostname": host,
-        "port": port,
-        "username": user,
-        "timeout": 30,
-        "banner_timeout": 30,
-        "auth_timeout": 30,
-    }
-    if auth_method == "pass":
-        connect_args["password"] = password
-    else:
-        key_file = io.StringIO(key_data)
-        try:
-            pkey = paramiko.RSAKey.from_private_key(key_file)
-        except Exception:
-            key_file.seek(0)
-            try:
-                pkey = paramiko.Ed25519Key.from_private_key(key_file)
-            except Exception:
-                key_file.seek(0)
-                pkey = paramiko.ECDSAKey.from_private_key(key_file)
-        connect_args["pkey"] = pkey
-    client.connect(**connect_args)
-    return client
-
-
-def _ssh_deploy(host, port, user, auth_method, password, key_data, bot_token, webapp_url):
-    client = None
-    try:
-        client = _ssh_connect(host, port, user, auth_method, password, key_data)
-        script = DEPLOY_SCRIPT.format(
-            repo=GITHUB_REPO,
-            bot_token=bot_token,
-            webapp_url=webapp_url or "",
-        )
-        stdin, stdout, stderr = client.exec_command("bash -s", timeout=300)
-        stdin.write(script)
-        stdin.channel.shutdown_write()
-        exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-        if exit_code == 0 and "DEPLOY_OK" in out:
-            return {"success": True, "output": out}
-        return {"success": False, "error": f"Exit code: {exit_code}\n{err}\n{out}"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-    finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
-
-
-@allowed_only
-async def deploy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-        msg = update.callback_query.message
-    else:
-        msg = update.message
-
-    if not HAS_PARAMIKO:
-        await msg.reply_text(
-            "╭─❀ <b>DEPLOY UNAVAILABLE</b> ❀─╮\n"
-            f"{DIV}\n\n"
-            "⚠️ The <code>paramiko</code> library is missing.\n\n"
-            "Install it with:\n<code>pip install paramiko</code>",
-            parse_mode="HTML",
-        )
-        return ConversationHandler.END
-
-    uid = update.effective_user.id if update.effective_user else None
-    if uid is None or not has_deploy_access(uid):
-        await msg.reply_text(
-            "╭─❀ <b>DEPLOY ACCESS DENIED</b> ❀─╮\n"
-            f"{DIV}\n\n"
-            "🚫 <b>You don't have permission to deploy.</b>\n\n"
-            "Contact the bot admin to request access.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📩 Request Access", url=f"tg://user?id={ADMIN_ID}")
-            ]]),
-        )
-        return ConversationHandler.END
-
-    for k in list(ctx.user_data.keys()):
-        if k.startswith("dep_"):
-            ctx.user_data.pop(k, None)
-
-    text = (
-        "╭─❀ <b>DEPLOY TO SERVER</b> ❀─╮\n"
-        f"{DIV}\n\n"
-        "🚀 Installs KabutiFlare on your Linux server via SSH "
-        "(Docker-based, fully automated).\n\n"
-        "📋 <b>What you need:</b>\n"
-        "  🖥  A Linux server (Ubuntu / Debian)\n"
-        "  🔐  SSH access — IP + password or key\n"
-        "  🤖  A Bot Token from @BotFather\n\n"
-        f"{DIV}\n"
-        "<b>Step 1 of 6 — Server Address</b>\n\n"
-        "Send the server <b>IP address or hostname</b>:\n\n"
-        "<i>Type /cancel at any time to abort.</i>"
-    )
-    if update.callback_query:
-        await msg.edit_text(text, parse_mode="HTML")
-    else:
-        await msg.reply_text(text, parse_mode="HTML")
-    return DEP_HOST
-
-
-async def deploy_host(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    host = update.message.text.strip()
-    if not host:
-        await update.message.reply_text("⚠️ Please send a valid IP address or hostname.")
-        return DEP_HOST
-    ctx.user_data["dep_host"] = host
-    await update.message.reply_text(
-        f"✅ <b>Server:</b> <code>{h(host)}</code>\n\n"
-        f"{DIV}\n"
-        "<b>Step 2 of 6 — SSH Port</b>\n\n"
-        "Send the SSH port (default is <code>22</code>):",
-        parse_mode="HTML",
-    )
-    return DEP_PORT
-
-
-async def deploy_port(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip()
-    try:
-        port = int(raw)
-    except ValueError:
-        port = 22
-    ctx.user_data["dep_port"] = port
-    await update.message.reply_text(
-        f"✅ <b>Port:</b> <code>{port}</code>\n\n"
-        f"{DIV}\n"
-        "<b>Step 3 of 6 — SSH Username</b>\n\n"
-        "Send the SSH username (usually <code>root</code>):",
-        parse_mode="HTML",
-    )
-    return DEP_USER
-
-
-async def deploy_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.message.text.strip()
-    if not user:
-        await update.message.reply_text("⚠️ Please send a valid username.")
-        return DEP_USER
-    ctx.user_data["dep_user"] = user
-    await update.message.reply_text(
-        f"✅ <b>Username:</b> <code>{h(user)}</code>\n\n"
-        f"{DIV}\n"
-        "<b>Step 4 of 6 — Authentication</b>\n\n"
-        "How do you want to authenticate?\n\n"
-        "  Reply <b>1</b> → Password\n"
-        "  Reply <b>2</b> → SSH Key",
-        parse_mode="HTML",
-    )
-    return DEP_AUTH
-
-
-async def deploy_auth_method(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    choice = update.message.text.strip()
-    if choice == "2":
-        ctx.user_data["dep_auth_method"] = "key"
-        await update.message.reply_text(
-            "🔐 <b>SSH Key</b>\n\nUpload your private key file, or paste its contents directly:",
-            parse_mode="HTML",
-        )
-        return DEP_KEY
-    elif choice == "1":
-        ctx.user_data["dep_auth_method"] = "pass"
-        await update.message.reply_text(
-            "🔑 <b>Password</b>\n\nSend the SSH password:\n\n"
-            "<i>⚠️ Your message will be deleted immediately.</i>",
-            parse_mode="HTML",
-        )
-        return DEP_PASS
-    else:
-        await update.message.reply_text(
-            "⚠️ Please reply with <b>1</b> (Password) or <b>2</b> (SSH Key):",
-            parse_mode="HTML",
-        )
-        return DEP_AUTH
-
-
-async def deploy_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["dep_password"] = update.message.text.strip()
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-    await update.effective_chat.send_message(
-        "✅ <b>Password saved</b> — message deleted for safety.\n\n"
-        f"{DIV}\n"
-        "<b>Step 5 of 6 — Bot Token</b>\n\n"
-        "Send the <b>Bot Token</b> for the bot you're deploying\n"
-        "<i>(get one from @BotFather)</i>:",
-        parse_mode="HTML",
-    )
-    return DEP_BOTTOKEN
-
-
-async def deploy_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.message.document:
-        f = await update.message.document.get_file()
-        ba = await f.download_as_bytearray()
-        ctx.user_data["dep_key_data"] = ba.decode("utf-8", errors="replace")
-    else:
-        ctx.user_data["dep_key_data"] = update.message.text.strip()
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-    await update.effective_chat.send_message(
-        "✅ <b>SSH key saved</b> — message deleted for safety.\n\n"
-        f"{DIV}\n"
-        "<b>Step 5 of 6 — Bot Token</b>\n\n"
-        "Send the <b>Bot Token</b> for the bot you're deploying\n"
-        "<i>(get one from @BotFather)</i>:",
-        parse_mode="HTML",
-    )
-    return DEP_BOTTOKEN
-
-
-async def deploy_bottoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    token = update.message.text.strip()
-    if ":" not in token:
-        await update.message.reply_text(
-            "⚠️ That doesn't look like a valid bot token. It should look like "
-            "<code>123456789:ABCdefGhIJKlmNoPQRstuVwxyZ</code>.\n\nTry again:",
-            parse_mode="HTML",
-        )
-        return DEP_BOTTOKEN
-    ctx.user_data["dep_bottoken"] = token
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-    await update.effective_chat.send_message(
-        "✅ <b>Bot token saved</b> — message deleted for safety.\n\n"
-        f"{DIV}\n"
-        "<b>Step 6 of 6 — Mini App URL</b>\n\n"
-        "Send your WebApp / Mini App URL,\n"
-        "or send <code>skip</code> if you don't need one:",
-        parse_mode="HTML",
-    )
-    return DEP_WEBAPP
-
-
-async def deploy_webapp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    webapp = update.message.text.strip()
-    if webapp.lower() == "skip":
-        webapp = ""
-    ctx.user_data["dep_webapp"] = webapp
-
-    host = ctx.user_data["dep_host"]
-    port = ctx.user_data["dep_port"]
-    user = ctx.user_data["dep_user"]
-    auth_method = ctx.user_data["dep_auth_method"]
-    password = ctx.user_data.get("dep_password", "")
-    key_data = ctx.user_data.get("dep_key_data", "")
-    bot_token = ctx.user_data["dep_bottoken"]
-
-    wait = await update.message.reply_text(
-        f"╭─❀ <b>DEPLOYING</b> ❀─╮\n{DIV}\n\n"
-        f"🖥 Server: <code>{h(user)}@{h(host)}:{port}</code>\n"
-        f"🔑 Auth: {'Password' if auth_method == 'pass' else 'SSH Key'}\n\n"
-        f"⏳ <b>Connecting via SSH...</b>\n"
-        f"<i>This usually takes 2–5 minutes. Please wait.</i>",
-        parse_mode="HTML",
-    )
-
-    result = await asyncio.to_thread(
-        _ssh_deploy, host, port, user, auth_method, password, key_data, bot_token, webapp
-    )
-
-    if result["success"]:
-        await wait.edit_text(
-            f"╭─❀ <b>DEPLOYMENT SUCCESSFUL</b> ❀─╮\n{DIV}\n\n"
-            f"✅ KabutiFlare is now running on your server!\n\n"
-            f"🖥 Server: <code>{h(host)}</code>\n"
-            f"📁 Path: <code>/opt/kabutiflare</code>\n"
-            f"🐳 Status: Running (Docker)\n\n"
-            f"🔧 <b>Useful commands:</b>\n"
-            f"<code>docker compose -f /opt/kabutiflare/docker-compose.yml logs -f</code>\n"
-            f"<code>docker compose -f /opt/kabutiflare/docker-compose.yml restart</code>",
-            parse_mode="HTML",
-        )
-    else:
-        err = result["error"][:1200]
-        tip = ""
-        low = err.lower()
-        if "timed out" in low or "timeout" in low:
-            tip = "\n\n💡 <b>Tip:</b> Check that the server IP/port is correct and reachable from the internet (firewall, security group, etc.)."
-        elif "authentication" in low:
-            tip = "\n\n💡 <b>Tip:</b> Wrong password or SSH key. Double check and try /deploy again."
-        elif "connection refused" in low:
-            tip = "\n\n💡 <b>Tip:</b> SSH port may be wrong, or SSH service isn't running on the server."
-        elif "name or service not known" in low or "nodename" in low:
-            tip = "\n\n💡 <b>Tip:</b> The hostname/IP couldn't be resolved. Check for typos."
-        await wait.edit_text(
-            f"╭─❀ <b>DEPLOYMENT FAILED</b> ❀─╮\n{DIV}\n\n❌ <pre>{h(err)}</pre>{tip}",
-            parse_mode="HTML",
-        )
-
-    for k in ["dep_password", "dep_key_data", "dep_bottoken"]:
-        ctx.user_data.pop(k, None)
-    return ConversationHandler.END
-
-
-async def deploy_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    for k in list(ctx.user_data.keys()):
-        if k.startswith("dep_"):
-            ctx.user_data.pop(k, None)
-    await update.message.reply_text("❌ Deploy cancelled.")
-    return ConversationHandler.END
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2849,12 +2389,11 @@ async def post_init(app):
         BotCommand("analytics", "📊 View traffic analytics"),
         BotCommand("disconnect", "🔌 Disconnect account"),
         BotCommand("help", "📖 Help & guide"),
-        BotCommand("deploy", "🚀 Deploy bot to a server"),
         BotCommand("stats", "📊 Bot stats (admin only)"),
         BotCommand("broadcast", "📢 Broadcast message (admin only)"),
-        BotCommand("grantdeploy", "🔓 Grant deploy access (admin only)"),
-        BotCommand("revokedeploy", "🔒 Revoke deploy access (admin only)"),
-        BotCommand("deploylist", "📋 List deploy access (admin only)"),
+        BotCommand("ban", "🚫 Ban user (admin only)"),
+        BotCommand("unban", "✅ Unban user (admin only)"),
+        BotCommand("banlist", "📋 Banned users (admin only)"),
     ]
     await app.bot.set_my_commands(commands)
     if WEBAPP_URL:
@@ -2871,35 +2410,6 @@ async def post_init(app):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    deploy_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("deploy", deploy_start),
-            CallbackQueryHandler(deploy_start, pattern="^do_deploy$"),
-        ],
-        states={
-            DEP_HOST: [MessageHandler(filters.TEXT & ~filters.COMMAND, deploy_host)],
-            DEP_PORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, deploy_port)],
-            DEP_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, deploy_user)],
-            DEP_AUTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, deploy_auth_method)],
-            DEP_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, deploy_password)],
-            DEP_KEY: [
-                MessageHandler(filters.Document.ALL, deploy_key),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, deploy_key),
-            ],
-            DEP_BOTTOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, deploy_bottoken)],
-            DEP_WEBAPP: [MessageHandler(filters.TEXT & ~filters.COMMAND, deploy_webapp)],
-        },
-        fallbacks=[
-            CommandHandler("start", cancel_and_start),
-            CommandHandler("cancel", deploy_cancel),
-        ],
-        per_chat=True,
-        per_user=True,
-        per_message=False,
-        allow_reentry=True,
-        conversation_timeout=900,
-    )
 
     connect_conv = ConversationHandler(
         entry_points=[
@@ -2977,7 +2487,6 @@ def main():
         conversation_timeout=600,
     )
 
-    app.add_handler(deploy_conv)
     app.add_handler(connect_conv)
     app.add_handler(add_conv)
     app.add_handler(edit_conv)
@@ -2991,9 +2500,9 @@ def main():
     app.add_handler(CommandHandler("analytics", global_analytics))
     app.add_handler(CommandHandler("disconnect", cmd_disconnect))
     app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("grantdeploy", cmd_grantdeploy))
-    app.add_handler(CommandHandler("revokedeploy", cmd_revokedeploy))
-    app.add_handler(CommandHandler("deploylist", cmd_deploylist))
+    app.add_handler(CommandHandler("ban", cmd_ban))
+    app.add_handler(CommandHandler("unban", cmd_unban))
+    app.add_handler(CommandHandler("banlist", cmd_banlist))
 
     app.add_handler(CallbackQueryHandler(cmd_domains, pattern="^do_domains$"))
     app.add_handler(CallbackQueryHandler(cmd_disconnect, pattern="^do_disconnect$"))
