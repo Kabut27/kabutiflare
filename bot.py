@@ -10,13 +10,22 @@ import socket
 import requests
 import asyncio
 import io
-from datetime import datetime
+from html import escape
+from datetime import datetime, timezone, timedelta
 from functools import wraps
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 try:
     import paramiko
     HAS_PARAMIKO = True
 except ImportError:
     HAS_PARAMIKO = False
+
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     WebAppInfo, BotCommand, MenuButtonWebApp
@@ -30,17 +39,21 @@ from telegram.ext import (
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CONFIG
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip()
 CF_API = "https://api.cloudflare.com/client/v4"
-ADMIN_ID = 474008580
-ALLOWED_USERS = {474008580, 5069084099}
+
+ADMIN_ID = int(os.getenv("ADMIN_ID", "474008580").strip())
+
+_raw_allowed = os.getenv("ALLOWED_USERS", "").strip()
+if _raw_allowed:
+    ALLOWED_USERS = {int(x.strip()) for x in _raw_allowed.split(",") if x.strip().isdigit()}
+else:
+    ALLOWED_USERS = {ADMIN_ID}
+ALLOWED_USERS.add(ADMIN_ID)  # Admin always has access
+
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
 GITHUB_REPO = "https://raw.githubusercontent.com/Kabut27/kabutiflare/main"
-
-# Deploy access: only users in this set can use /deploy
-# Admin can manage this list via /grantdeploy and /revokedeploy
-DEPLOY_ALLOWED_USERS: set = {474008580}  # admin always has access
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is required. Set via environment variable or .env file.")
@@ -48,12 +61,19 @@ if not BOT_TOKEN:
 # Brand divider used across messages for a consistent, polished look
 DIV = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
 
+
+def h(val) -> str:
+    """Escape dynamic text safely for Telegram HTML parse_mode."""
+    return escape(str(val)) if val is not None else ""
+
+
 def webapp_btn(text, zid=None):
     """Return WebApp button only if WEBAPP_URL is set, else None."""
     if not WEBAPP_URL:
         return None
     url = f"{WEBAPP_URL}?zone={zid}" if zid else WEBAPP_URL
     return InlineKeyboardButton(text, web_app=WebAppInfo(url=url))
+
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,8 +83,10 @@ logger = logging.getLogger(__name__)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _orig_getaddrinfo = socket.getaddrinfo
 
+
 def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
 
 socket.getaddrinfo = _ipv4_getaddrinfo
 
@@ -75,74 +97,110 @@ CONNECT_METHOD, CONNECT_EMAIL, CONNECT_KEY = 0, 1, 2
 ADD_TYPE, ADD_NAME, ADD_CONTENT, ADD_PROXY = 10, 11, 12, 13
 EDIT_VALUE = 50
 BROADCAST_MSG = 60
-PR_URL, PR_ACTION = 70, 71
-WK_CODE = 80
-# Deploy flow uses plain text replies for every step (1/2 instead of
-# inline buttons) so the conversation can never lose a step to a stray
-# callback handler — this is the #1 cause of "deploy skips a step" bugs.
-DEP_HOST, DEP_PORT, DEP_USER, DEP_AUTH, DEP_PASS, DEP_KEY, DEP_BOTTOKEN, DEP_WEBAPP, DEP_CONFIRM = 90, 91, 92, 93, 94, 95, 96, 97, 98
+DEP_HOST, DEP_PORT, DEP_USER, DEP_AUTH, DEP_PASS, DEP_KEY, DEP_BOTTOKEN, DEP_WEBAPP = (
+    90, 91, 92, 93, 94, 95, 96, 97
+)
 EM_FROM, EM_TO = 200, 201
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  USER DATABASE (persistent JSON)
+#  USER DATABASE (persistent JSON with atomic writes)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def load_db():
     try:
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            db = json.load(f)
     except Exception:
-        return {"users": {}, "cf_logins": {}}
+        db = {}
+    db.setdefault("users", {})
+    db.setdefault("cf_logins", {})
+    db.setdefault("deploy_allowed", [ADMIN_ID])
+    if ADMIN_ID not in db["deploy_allowed"]:
+        db["deploy_allowed"].append(ADMIN_ID)
+    return db
+
 
 def save_db(db):
-    with open(DB_FILE, "w") as f:
+    tmp = f"{DB_FILE}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, DB_FILE)
+
 
 def track_user(uid, name="", username=""):
     db = load_db()
     uid_str = str(uid)
+    now = datetime.now().isoformat()
     if uid_str not in db["users"]:
         db["users"][uid_str] = {
-            "name": name, "username": username,
-            "first_seen": datetime.now().isoformat(),
-            "last_seen": datetime.now().isoformat()
+            "name": name,
+            "username": username,
+            "first_seen": now,
+            "last_seen": now,
         }
     else:
-        db["users"][uid_str]["last_seen"] = datetime.now().isoformat()
-        if name: db["users"][uid_str]["name"] = name
-        if username: db["users"][uid_str]["username"] = username
+        db["users"][uid_str]["last_seen"] = now
+        if name:
+            db["users"][uid_str]["name"] = name
+        if username:
+            db["users"][uid_str]["username"] = username
     save_db(db)
+
 
 def track_cf_login(uid, name=""):
     db = load_db()
-    uid_str = str(uid)
-    db["cf_logins"][uid_str] = {
+    db["cf_logins"][str(uid)] = {
         "name": name,
-        "last_login": datetime.now().isoformat()
+        "last_login": datetime.now().isoformat(),
     }
     save_db(db)
+
 
 def is_admin(uid):
     return uid == ADMIN_ID
 
-def has_deploy_access(uid):
-    """Returns True if the user is allowed to use /deploy."""
-    return uid in DEPLOY_ALLOWED_USERS
+
+def get_deploy_allowed() -> set:
+    return set(load_db().get("deploy_allowed", [ADMIN_ID]))
+
+
+def has_deploy_access(uid) -> bool:
+    return uid == ADMIN_ID or uid in get_deploy_allowed()
+
 
 def grant_deploy(uid):
-    DEPLOY_ALLOWED_USERS.add(uid)
+    db = load_db()
+    if uid not in db["deploy_allowed"]:
+        db["deploy_allowed"].append(uid)
+        save_db(db)
+
 
 def revoke_deploy(uid):
-    DEPLOY_ALLOWED_USERS.discard(uid)
+    if uid == ADMIN_ID:
+        return
+    db = load_db()
+    db["deploy_allowed"] = [u for u in db["deploy_allowed"] if u != uid]
+    save_db(db)
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  IN-MEMORY SESSIONS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 sessions = {}
-def get_s(uid): return sessions.get(uid, {})
+
+
+def get_s(uid):
+    return sessions.get(uid, {})
+
+
 def set_s(uid, data):
-    if uid not in sessions: sessions[uid] = {}
+    if uid not in sessions:
+        sessions[uid] = {}
     sessions[uid].update(data)
-def del_s(uid): sessions.pop(uid, None)
+
+
+def del_s(uid):
+    sessions.pop(uid, None)
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CLOUDFLARE API
@@ -151,12 +209,18 @@ def cf_h(uid):
     s = get_s(uid)
     if s.get("auth") == "token":
         return {"Authorization": f"Bearer {s['key']}", "Content-Type": "application/json"}
-    return {"X-Auth-Email": s.get("email", ""), "X-Auth-Key": s.get("key", ""), "Content-Type": "application/json"}
+    return {
+        "X-Auth-Email": s.get("email", ""),
+        "X-Auth-Key": s.get("key", ""),
+        "Content-Type": "application/json",
+    }
+
 
 def get_account_id(uid=None, zone=None):
     if zone and zone.get("account", {}).get("id"):
         return zone["account"]["id"]
     return ""
+
 
 def cf_get(uid, path, params=None):
     r = requests.get(f"{CF_API}{path}", headers=cf_h(uid), params=params, timeout=15)
@@ -165,12 +229,14 @@ def cf_get(uid, path, params=None):
         raise Exception(", ".join(e.get("message", "") for e in d.get("errors", [])) or "Unknown error")
     return d
 
+
 def cf_post(uid, path, body):
     r = requests.post(f"{CF_API}{path}", headers=cf_h(uid), json=body, timeout=15)
     d = r.json()
     if not d.get("success"):
         raise Exception(", ".join(e.get("message", "") for e in d.get("errors", [])) or "Unknown error")
     return d
+
 
 def cf_put(uid, path, body):
     r = requests.put(f"{CF_API}{path}", headers=cf_h(uid), json=body, timeout=15)
@@ -179,6 +245,7 @@ def cf_put(uid, path, body):
         raise Exception(", ".join(e.get("message", "") for e in d.get("errors", [])) or "Unknown error")
     return d
 
+
 def cf_del(uid, path):
     r = requests.delete(f"{CF_API}{path}", headers=cf_h(uid), timeout=15)
     d = r.json()
@@ -186,42 +253,69 @@ def cf_del(uid, path):
         raise Exception(", ".join(e.get("message", "") for e in d.get("errors", [])) or "Unknown error")
     return d
 
+
 def cf_patch(uid, path, body):
     r = requests.patch(f"{CF_API}{path}", headers=cf_h(uid), json=body, timeout=15)
     return r.json()
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  AUTH GUARD
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def need_auth(func):
+def allowed_only(func):
+    """Block any user who is not in ALLOWED_USERS."""
     @wraps(func)
     async def w(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id
-        if uid not in ALLOWED_USERS:
+        user = update.effective_user
+        if not user or user.id not in ALLOWED_USERS:
+            if update.callback_query:
+                await update.callback_query.answer("⛔ Access denied.", show_alert=True)
+            elif update.message:
+                await update.message.reply_text(
+                    "⛔ <b>Access denied.</b>\n\nYou're not authorized to use this bot.",
+                    parse_mode="HTML",
+                )
+            return ConversationHandler.END
+        return await func(update, ctx)
+    return w
+
+
+def need_auth(func):
+    """Require user to be in ALLOWED_USERS AND connected to Cloudflare."""
+    @wraps(func)
+    async def w(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if not user or user.id not in ALLOWED_USERS:
+            if update.callback_query:
+                await update.callback_query.answer("⛔ Access denied.", show_alert=True)
+            elif update.message:
+                await update.message.reply_text(
+                    "⛔ <b>Access denied.</b>\n\nYou're not authorized to use this bot.",
+                    parse_mode="HTML",
+                )
+            return ConversationHandler.END
+        if not get_s(user.id).get("key"):
             msg = update.message or update.callback_query.message
-            await msg.reply_text("⛔ <b>Access denied.</b>\n\nYou're not authorized to use this bot.", parse_mode="HTML")
-            return
-        if not get_s(uid).get("key"):
-            msg = update.message or update.callback_query.message
+            if update.callback_query:
+                await update.callback_query.answer()
             await msg.reply_text(
                 "🔒 <b>Not connected yet</b>\n\nConnect your Cloudflare account first to continue.",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔐 Connect to Cloudflare", callback_data="do_connect")
-                ]])
+                ]]),
             )
-            return
+            return ConversationHandler.END
         return await func(update, ctx)
     return w
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  /start
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@allowed_only
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid not in ALLOWED_USERS:
-        await update.message.reply_text("⛔ <b>Access denied.</b>", parse_mode="HTML")
-        return
     name = update.effective_user.first_name or "there"
     username = update.effective_user.username or ""
     track_user(uid, name, username)
@@ -231,7 +325,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"╭─❀ <b>KABUTIFLARE</b> ❀─╮\n"
         f"<i>Cloudflare control, right in Telegram</i>\n"
         f"{DIV}\n\n"
-        f"👋 Welcome back, <b>{name}</b>!\n\n"
+        f"👋 Welcome back, <b>{h(name)}</b>!\n\n"
     )
 
     if logged:
@@ -257,16 +351,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  /help
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@allowed_only
 async def send_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
     if update.callback_query:
         await update.callback_query.answer()
 
     text = (
-        "╭─❀ <b>HELP & GUIDE</b> ❀─╮\n"
+        "╭─❀ <b>HELP &amp; GUIDE</b> ❀─╮\n"
         f"{DIV}\n\n"
         "🔹 <b>Commands</b>\n"
         "/connect — Connect to Cloudflare\n"
@@ -280,8 +376,8 @@ async def send_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔒 SSL/TLS — Switch encryption modes\n"
         "📛 Nameservers — View NS records\n"
         "🌐 Zone Settings — HTTPS, TLS 1.3, HTTP/3, Brotli…\n"
-        "🔀 Page Rules — Create redirects & rules\n"
-        "👷 Workers — Upload, edit & manage scripts\n"
+        "🔀 Page Rules — View &amp; delete rules\n"
+        "👷 Workers — View &amp; manage worker routes\n"
         "📧 Email Routing — Manage forwarding rules\n"
         "📊 Analytics — Traffic, cache, threats (24h)\n"
         "🖥 Dashboard — Full Mini App experience\n\n"
@@ -295,6 +391,7 @@ async def send_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "   <code>Zone · Page Rules · Edit</code>\n"
         "   <code>Zone · Workers Routes · Edit</code>\n"
         "   <code>Zone · Email Routing Rules · Edit</code>\n"
+        "   <code>Zone · Analytics · Read</code>\n"
         "   <code>Account · Workers Scripts · Edit</code>\n"
         "4️⃣ Zone Resources → All zones\n"
         "5️⃣ Copy your token and send it here\n"
@@ -305,9 +402,11 @@ async def send_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await msg.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  /connect
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@allowed_only
 async def connect_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer()
@@ -335,6 +434,7 @@ async def connect_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
     return CONNECT_METHOD
 
+
 async def connect_method(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -344,23 +444,31 @@ async def connect_method(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if q.data == "m_token":
         ctx.user_data["auth"] = "token"
         await q.message.edit_text(
-            "🛡 <b>API Token</b>\n\nPaste your API Token below:\n\n<i>⚠️ Your message will be deleted immediately for security.</i>",
-            parse_mode="HTML")
+            "🛡 <b>API Token</b>\n\nPaste your API Token below:\n\n"
+            "<i>⚠️ Your message will be deleted immediately for security.</i>",
+            parse_mode="HTML",
+        )
         return CONNECT_KEY
     if q.data == "m_apikey":
         ctx.user_data["auth"] = "apikey"
         await q.message.edit_text(
-            "🔑 <b>Global API Key</b>\n\nFirst, send your Cloudflare <b>email address</b>:", parse_mode="HTML")
+            "🔑 <b>Global API Key</b>\n\nFirst, send your Cloudflare <b>email address</b>:",
+            parse_mode="HTML",
+        )
         return CONNECT_EMAIL
     return CONNECT_METHOD
+
 
 async def connect_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["email"] = update.message.text.strip()
     await update.message.reply_text(
-        f"📧 Email: <code>{ctx.user_data['email']}</code>\n\n"
-        "Now send your <b>Global API Key</b>:\n\n<i>⚠️ Your message will be deleted immediately for security.</i>",
-        parse_mode="HTML")
+        f"📧 Email: <code>{h(ctx.user_data['email'])}</code>\n\n"
+        "Now send your <b>Global API Key</b>:\n\n"
+        "<i>⚠️ Your message will be deleted immediately for security.</i>",
+        parse_mode="HTML",
+    )
     return CONNECT_KEY
+
 
 async def connect_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -388,19 +496,24 @@ async def connect_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await wait.edit_text(
             "✅ <b>Connected successfully!</b>\n\nYour Cloudflare account is now linked.",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(_btns))
+            reply_markup=InlineKeyboardMarkup(_btns),
+        )
     except Exception as e:
         del_s(uid)
         await wait.edit_text(
-            f"❌ <b>Connection failed</b>\n\n<code>{e}</code>", parse_mode="HTML",
+            f"❌ <b>Connection failed</b>\n\n<code>{h(e)}</code>",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Try Again", callback_data="do_connect")]
-            ]))
+            ]),
+        )
     return ConversationHandler.END
+
 
 async def connect_cancel_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  /domains
@@ -429,7 +542,6 @@ async def cmd_domains(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         ico = {"active": "🟢", "pending": "🟡", "moved": "🔴", "deactivated": "🔴"}
-        # Color per domain so each is visually distinct
         DOMAIN_COLORS = ["🔵", "🟣", "🟠", "🩷", "🔷", "🟤", "⚫", "🟡"]
         text = f"╭─❀ <b>YOUR DOMAINS</b> ❀─╮\n{DIV}\n\n🌐 <b>{len(zones)}</b> domain(s) found\n"
         btns = []
@@ -437,8 +549,11 @@ async def cmd_domains(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             status = ico.get(z["status"], "⚪")
             plan = z.get("plan", {}).get("name", "Free")
             color = DOMAIN_COLORS[idx % len(DOMAIN_COLORS)]
-            # Show color + status + name. If active (most common) skip redundant status dot
-            label = f"{color} {z['name']}  •  {plan}" if z["status"] == "active" else f"{color} {status} {z['name']}  •  {plan}"
+            label = (
+                f"{color} {z['name']}  •  {plan}"
+                if z["status"] == "active"
+                else f"{color} {status} {z['name']}  •  {plan}"
+            )
             btns.append([InlineKeyboardButton(label, callback_data=f"zone_{z['id']}")])
         _last = [InlineKeyboardButton("🔄 Refresh", callback_data="do_domains")]
         if WEBAPP_URL:
@@ -446,11 +561,13 @@ async def cmd_domains(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         btns.append(_last)
         await wait.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
     except Exception as e:
-        await wait.edit_text(f"❌ Error: <code>{e}</code>", parse_mode="HTML")
+        await wait.edit_text(f"❌ Error: <code>{h(e)}</code>", parse_mode="HTML")
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  ZONE OVERVIEW
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@need_auth
 async def zone_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -463,12 +580,12 @@ async def zone_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     set_s(uid, {"cur_zone": zone})
     st = {"active": "🟢 Active", "pending": "🟡 Pending", "moved": "🔴 Moved"}
-    ns = "\n".join(f"   <code>{n}</code>" for n in zone.get("name_servers", []))
-    plan_name = zone.get('plan', {}).get('name', 'Free')
+    ns = "\n".join(f"   <code>{h(n)}</code>" for n in zone.get("name_servers", []))
+    plan_name = zone.get("plan", {}).get("name", "Free")
     text = (
-        f"╭─❀ <b>{zone['name']}</b> ❀─╮\n{DIV}\n\n"
-        f"📍 Status: {st.get(zone['status'], zone['status'])}\n"
-        f"💳 Plan: <b>{plan_name}</b>\n\n"
+        f"╭─❀ <b>{h(zone['name'])}</b> ❀─╮\n{DIV}\n\n"
+        f"📍 Status: {st.get(zone['status'], h(zone['status']))}\n"
+        f"💳 Plan: <b>{h(plan_name)}</b>\n\n"
         f"📛 <b>Nameservers:</b>\n{ns}\n"
     )
     btns = [
@@ -487,11 +604,17 @@ async def zone_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     btns.append([InlineKeyboardButton("🔙 All Domains", callback_data="do_domains")])
     await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  DNS LIST
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TYPE_ICON = {"A": "🔵", "AAAA": "🟣", "CNAME": "🟢", "MX": "🟡", "TXT": "🩷", "NS": "🔷", "SRV": "🟠", "CAA": "🟤"}
+TYPE_ICON = {
+    "A": "🔵", "AAAA": "🟣", "CNAME": "🟢", "MX": "🟡",
+    "TXT": "🩷", "NS": "🔷", "SRV": "🟠", "CAA": "🟤",
+}
 
+
+@need_auth
 async def dns_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -514,12 +637,12 @@ async def dns_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if not recs:
             await wait.edit_text(
-                f"📭 No DNS records for <b>{zone.get('name','')}</b>.",
+                f"📭 No DNS records for <b>{h(zone.get('name', ''))}</b>.",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("➕ Add Record", callback_data=f"add_{zid}")],
                     [InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")],
-                ])
+                ]),
             )
             return
 
@@ -527,125 +650,214 @@ async def dns_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for r in recs:
             counts[r["type"]] = counts.get(r["type"], 0) + 1
 
-        text = f"╭─❀ <b>DNS — {zone.get('name','')}</b> ❀─╮\n{DIV}\n\n📋 <b>{len(recs)}</b> record(s)\n\n"
+        text = (
+            f"╭─❀ <b>DNS — {h(zone.get('name', ''))}</b> ❀─╮\n{DIV}\n\n"
+            f"📋 <b>{len(recs)}</b> record(s)\n\n"
+        )
         fbtns = []
         row = []
         for t, c in sorted(counts.items()):
             icon = TYPE_ICON.get(t, "⚪")
-            text += f"{icon} <b>{t}</b> — {c}\n"
+            text += f"{icon} <b>{h(t)}</b> — {c}\n"
             row.append(InlineKeyboardButton(f"{icon} {t} ({c})", callback_data=f"ft_{zid}_{t}"))
             if len(row) >= 2:
-                fbtns.append(row); row = []
-        if row: fbtns.append(row)
+                fbtns.append(row)
+                row = []
+        if row:
+            fbtns.append(row)
 
         fbtns.append([InlineKeyboardButton("➕ Add Record", callback_data=f"add_{zid}")])
         fbtns.append([InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")])
         await wait.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(fbtns))
     except Exception as e:
-        await wait.edit_text(f"❌ Error: <code>{e}</code>", parse_mode="HTML")
+        await wait.edit_text(f"❌ Error: <code>{h(e)}</code>", parse_mode="HTML")
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  DNS FILTER (by type)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@need_auth
 async def dns_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    parts = q.data.split("_"); zid, rtype = parts[1], parts[2]
-    s = get_s(uid); zone = s.get("cur_zone", {})
+    parts = q.data.split("_")
+    zid, rtype = parts[1], parts[2]
+    s = get_s(uid)
+    zone = s.get("cur_zone", {})
     recs = [r for r in s.get("dns", []) if r["type"] == rtype]
     icon = TYPE_ICON.get(rtype, "⚪")
-    text = f"{icon} <b>{rtype} Records — {zone.get('name','')}</b>\n{len(recs)} record(s)\n\n"
+    text = f"{icon} <b>{h(rtype)} Records — {h(zone.get('name', ''))}</b>\n{len(recs)} record(s)\n\n"
     btns = []
     for r in recs[:20]:
-        nm = r["name"].replace(f".{zone.get('name','')}", "") or "@"
+        nm = r["name"].replace(f".{zone.get('name', '')}", "") or "@"
         ct = r["content"][:25] + ("…" if len(r["content"]) > 25 else "")
         px = "☁️" if r.get("proxied") else "🔘"
-        text += f"<code>{nm}</code> → <code>{ct}</code> {px}\n"
+        text += f"<code>{h(nm)}</code> → <code>{h(ct)}</code> {px}\n"
         btns.append([InlineKeyboardButton(f"✏️ {nm} → {ct}", callback_data=f"ed_{r['id']}")])
-    btns.append([InlineKeyboardButton("🔙 All Records", callback_data=f"dns_{zid}"), InlineKeyboardButton("➕ Add", callback_data=f"add_{zid}")])
+    btns.append([
+        InlineKeyboardButton("🔙 All Records", callback_data=f"dns_{zid}"),
+        InlineKeyboardButton("➕ Add", callback_data=f"add_{zid}"),
+    ])
     await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  ADD DNS RECORD
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@need_auth
 async def add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    zid = q.data.replace("add_", ""); ctx.user_data["add_zid"] = zid
+    q = update.callback_query
+    await q.answer()
+    zid = q.data.replace("add_", "")
+    ctx.user_data["add_zid"] = zid
     types = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "CAA"]
-    btns = []; row = []
+    btns = []
+    row = []
     for t in types:
         row.append(InlineKeyboardButton(t, callback_data=f"at_{t}"))
-        if len(row) >= 4: btns.append(row); row = []
-    if row: btns.append(row)
+        if len(row) >= 4:
+            btns.append(row)
+            row = []
+    if row:
+        btns.append(row)
     btns.append([InlineKeyboardButton("❌ Cancel", callback_data=f"zone_{zid}")])
-    await q.message.edit_text("➕ <b>New DNS Record</b>\n\nSelect a record type:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
+    await q.message.edit_text(
+        "➕ <b>New DNS Record</b>\n\nSelect a record type:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(btns),
+    )
     return ADD_TYPE
 
+
 async def add_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     ctx.user_data["add_type"] = q.data.replace("at_", "")
     t = ctx.user_data["add_type"]
-    ph = {"A": "@ or www", "AAAA": "@ or www", "CNAME": "www", "MX": "@", "TXT": "@ or _dmarc", "NS": "sub", "SRV": "_sip._tcp", "CAA": "@"}
-    await q.message.edit_text(f"➕ <b>{t} Record</b>\n\nSend the <b>name</b>:\n<i>{ph.get(t,'')} — root = @</i>", parse_mode="HTML")
+    ph = {
+        "A": "@ or www", "AAAA": "@ or www", "CNAME": "www", "MX": "@",
+        "TXT": "@ or _dmarc", "NS": "sub", "SRV": "_sip._tcp", "CAA": "@",
+    }
+    await q.message.edit_text(
+        f"➕ <b>{h(t)} Record</b>\n\nSend the <b>name</b>:\n<i>{ph.get(t, '')} — root = @</i>",
+        parse_mode="HTML",
+    )
     return ADD_NAME
+
 
 async def add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["add_name"] = update.message.text.strip()
     t = ctx.user_data["add_type"]
-    hints = {"A": "<code>1.2.3.4</code>", "AAAA": "<code>2001:db8::1</code>", "CNAME": "<code>example.com</code>", "MX": "<code>mail.example.com</code>", "TXT": "<code>v=spf1 ...</code>", "NS": "<code>ns1.example.com</code>", "SRV": "<code>priority weight port target</code>", "CAA": '<code>0 issue "letsencrypt.org"</code>'}
-    await update.message.reply_text(f"✅ Name: <code>{ctx.user_data['add_name']}</code>\n\n<b>Value:</b>\n{hints.get(t,'')}", parse_mode="HTML")
+    hints = {
+        "A": "<code>1.2.3.4</code>",
+        "AAAA": "<code>2001:db8::1</code>",
+        "CNAME": "<code>example.com</code>",
+        "MX": "<code>mail.example.com</code>",
+        "TXT": "<code>v=spf1 ...</code>",
+        "NS": "<code>ns1.example.com</code>",
+        "SRV": "<code>priority weight port target</code>",
+        "CAA": '<code>0 issue "letsencrypt.org"</code>',
+    }
+    await update.message.reply_text(
+        f"✅ Name: <code>{h(ctx.user_data['add_name'])}</code>\n\n<b>Value:</b>\n{hints.get(t, '')}",
+        parse_mode="HTML",
+    )
     return ADD_CONTENT
+
 
 async def add_content(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["add_content"] = update.message.text.strip()
     t = ctx.user_data["add_type"]
     if t in ("A", "AAAA", "CNAME"):
-        await update.message.reply_text(f"✅ Value: <code>{ctx.user_data['add_content']}</code>\n\nProxy status:", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("☁️ Proxied", callback_data="px_on"), InlineKeyboardButton("🔘 DNS Only", callback_data="px_off")]]))
+        await update.message.reply_text(
+            f"✅ Value: <code>{h(ctx.user_data['add_content'])}</code>\n\nProxy status:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("☁️ Proxied", callback_data="px_on"),
+                InlineKeyboardButton("🔘 DNS Only", callback_data="px_off"),
+            ]]),
+        )
         return ADD_PROXY
-    else:
-        ctx.user_data["add_proxy"] = False
-        return await do_add_submit(update, ctx)
+    ctx.user_data["add_proxy"] = False
+    return await do_add_submit(update, ctx)
+
 
 async def add_proxy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     ctx.user_data["add_proxy"] = q.data == "px_on"
     return await do_add_submit(update, ctx)
 
+
 async def do_add_submit(update, ctx):
-    if update.callback_query: msg = update.callback_query.message; uid = update.callback_query.from_user.id
-    else: msg = update.message; uid = update.effective_user.id
-    zid = ctx.user_data["add_zid"]; t = ctx.user_data["add_type"]; name = ctx.user_data["add_name"]
-    content = ctx.user_data["add_content"]; proxied = ctx.user_data.get("add_proxy", False)
-    s = get_s(uid); zone = s.get("cur_zone", {})
-    if name == "@": name = zone.get("name", name)
-    elif not name.endswith(zone.get("name", "")): name = f"{name}.{zone.get('name', '')}"
+    if update.callback_query:
+        msg = update.callback_query.message
+        uid = update.callback_query.from_user.id
+    else:
+        msg = update.message
+        uid = update.effective_user.id
+
+    zid = ctx.user_data["add_zid"]
+    t = ctx.user_data["add_type"]
+    name = ctx.user_data["add_name"]
+    content = ctx.user_data["add_content"]
+    proxied = ctx.user_data.get("add_proxy", False)
+
+    s = get_s(uid)
+    zone = s.get("cur_zone", {})
+    if name == "@":
+        name = zone.get("name", name)
+    elif not name.endswith(zone.get("name", "")):
+        name = f"{name}.{zone.get('name', '')}"
+
     body = {"type": t, "name": name, "content": content, "ttl": 1}
-    if t in ("A", "AAAA", "CNAME"): body["proxied"] = proxied
+    if t in ("A", "AAAA", "CNAME"):
+        body["proxied"] = proxied
+
     wait = await msg.reply_text("⏳ Creating record...")
     try:
         cf_post(uid, f"/zones/{zid}/dns_records", body)
         px_txt = "☁️ Proxied" if proxied else "🔘 DNS Only"
-        await wait.edit_text(f"✅ <b>Record created!</b>\n\n<code>{t}</code> | <code>{name}</code>\n→ <code>{content}</code> {px_txt}", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 View Records", callback_data=f"dns_{zid}"), InlineKeyboardButton("➕ Add Another", callback_data=f"add_{zid}")]]))
+        await wait.edit_text(
+            f"✅ <b>Record created!</b>\n\n"
+            f"<code>{h(t)}</code> | <code>{h(name)}</code>\n"
+            f"→ <code>{h(content)}</code> {px_txt}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 View Records", callback_data=f"dns_{zid}"),
+                InlineKeyboardButton("➕ Add Another", callback_data=f"add_{zid}"),
+            ]]),
+        )
     except Exception as e:
-        await wait.edit_text(f"❌ Error: <code>{e}</code>", parse_mode="HTML")
+        await wait.edit_text(f"❌ Error: <code>{h(e)}</code>", parse_mode="HTML")
     return ConversationHandler.END
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  EDIT / DELETE DNS RECORD
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@need_auth
 async def edit_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    uid = q.from_user.id; rid = q.data.replace("ed_", "")
-    s = get_s(uid); rec = next((r for r in s.get("dns", []) if r["id"] == rid), None)
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    rid = q.data.replace("ed_", "")
+    s = get_s(uid)
+    rec = next((r for r in s.get("dns", []) if r["id"] == rid), None)
     zid = s.get("cur_zone", {}).get("id", "")
-    if not rec: await q.message.edit_text("❌ Not found."); return
+    if not rec:
+        await q.message.edit_text("❌ Not found.")
+        return
     ctx.user_data["edit_rec"] = rec
     px_txt = "☁️ Proxied" if rec.get("proxied") else "🔘 DNS Only"
     ttl = "Auto" if rec.get("ttl") == 1 else f"{rec['ttl']}s"
-    text = f"✏️ <b>Edit Record</b>\n\n<code>{rec['type']}</code> | <code>{rec['name']}</code>\n→ <code>{rec['content']}</code>\nTTL: {ttl} | {px_txt}"
+    text = (
+        f"✏️ <b>Edit Record</b>\n\n"
+        f"<code>{h(rec['type'])}</code> | <code>{h(rec['name'])}</code>\n"
+        f"→ <code>{h(rec['content'])}</code>\n"
+        f"TTL: {ttl} | {px_txt}"
+    )
     btns = [[InlineKeyboardButton("📝 Change Value", callback_data=f"ec_{rid}")]]
     if rec["type"] in ("A", "AAAA", "CNAME"):
         toggle = "Disable" if rec.get("proxied") else "Enable"
@@ -654,79 +866,154 @@ async def edit_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     btns.append([InlineKeyboardButton("🔙 Back", callback_data=f"dns_{zid}")])
     await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
+
+@need_auth
 async def toggle_proxy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    uid = q.from_user.id; rid = q.data.replace("ep_", "")
-    s = get_s(uid); rec = next((r for r in s.get("dns", []) if r["id"] == rid), None)
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    rid = q.data.replace("ep_", "")
+    s = get_s(uid)
+    rec = next((r for r in s.get("dns", []) if r["id"] == rid), None)
     zid = s.get("cur_zone", {}).get("id", "")
-    if not rec: return
+    if not rec:
+        return
     new_px = not rec.get("proxied", False)
     wait = await q.message.edit_text("⏳ Updating...")
     try:
-        cf_put(uid, f"/zones/{zid}/dns_records/{rid}", {"type": rec["type"], "name": rec["name"], "content": rec["content"], "ttl": rec.get("ttl", 1), "proxied": new_px})
+        cf_put(
+            uid,
+            f"/zones/{zid}/dns_records/{rid}",
+            {
+                "type": rec["type"],
+                "name": rec["name"],
+                "content": rec["content"],
+                "ttl": rec.get("ttl", 1),
+                "proxied": new_px,
+            },
+        )
         st = "Enabled ☁️" if new_px else "Disabled 🔘"
-        await wait.edit_text(f"✅ Proxy {st}.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Records", callback_data=f"dns_{zid}")]]))
+        await wait.edit_text(
+            f"✅ Proxy {st}.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Records", callback_data=f"dns_{zid}")
+            ]]),
+        )
     except Exception as e:
-        await wait.edit_text(f"❌ Error: <code>{e}</code>", parse_mode="HTML")
+        await wait.edit_text(f"❌ Error: <code>{h(e)}</code>", parse_mode="HTML")
 
+
+@need_auth
 async def edit_content_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     rid = q.data.replace("ec_", "")
-    s = get_s(q.from_user.id); rec = next((r for r in s.get("dns", []) if r["id"] == rid), None)
-    if not rec: return ConversationHandler.END
-    ctx.user_data["edit_rec"] = rec; ctx.user_data["edit_rid"] = rid
-    await q.message.edit_text(f"📝 Current value:\n<code>{rec['content']}</code>\n\nSend the new value:", parse_mode="HTML")
+    s = get_s(q.from_user.id)
+    rec = next((r for r in s.get("dns", []) if r["id"] == rid), None)
+    if not rec:
+        return ConversationHandler.END
+    ctx.user_data["edit_rec"] = rec
+    ctx.user_data["edit_rid"] = rid
+    await q.message.edit_text(
+        f"📝 Current value:\n<code>{h(rec['content'])}</code>\n\nSend the new value:",
+        parse_mode="HTML",
+    )
     return EDIT_VALUE
 
+
 async def edit_content_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id; val = update.message.text.strip()
-    rec = ctx.user_data.get("edit_rec"); rid = ctx.user_data.get("edit_rid")
-    s = get_s(uid); zid = s.get("cur_zone", {}).get("id", "")
-    if not rec: await update.message.reply_text("❌ Not found."); return ConversationHandler.END
+    uid = update.effective_user.id
+    val = update.message.text.strip()
+    rec = ctx.user_data.get("edit_rec")
+    rid = ctx.user_data.get("edit_rid")
+    s = get_s(uid)
+    zid = s.get("cur_zone", {}).get("id", "")
+    if not rec:
+        await update.message.reply_text("❌ Not found.")
+        return ConversationHandler.END
     wait = await update.message.reply_text("⏳ Updating...")
     try:
-        body = {"type": rec["type"], "name": rec["name"], "content": val, "ttl": rec.get("ttl", 1)}
-        if rec["type"] in ("A", "AAAA", "CNAME"): body["proxied"] = rec.get("proxied", False)
+        body = {
+            "type": rec["type"],
+            "name": rec["name"],
+            "content": val,
+            "ttl": rec.get("ttl", 1),
+        }
+        if rec["type"] in ("A", "AAAA", "CNAME"):
+            body["proxied"] = rec.get("proxied", False)
         cf_put(uid, f"/zones/{zid}/dns_records/{rid}", body)
-        await wait.edit_text(f"✅ <b>Updated!</b>\n<code>{rec['name']}</code> → <code>{val}</code>", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Records", callback_data=f"dns_{zid}")]]))
+        await wait.edit_text(
+            f"✅ <b>Updated!</b>\n<code>{h(rec['name'])}</code> → <code>{h(val)}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Records", callback_data=f"dns_{zid}")
+            ]]),
+        )
     except Exception as e:
-        await wait.edit_text(f"❌ Error: <code>{e}</code>", parse_mode="HTML")
+        await wait.edit_text(f"❌ Error: <code>{h(e)}</code>", parse_mode="HTML")
     return ConversationHandler.END
 
+
+@need_auth
 async def delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    rid = q.data.replace("dl_", ""); s = get_s(q.from_user.id)
+    q = update.callback_query
+    await q.answer()
+    rid = q.data.replace("dl_", "")
+    s = get_s(q.from_user.id)
     rec = next((r for r in s.get("dns", []) if r["id"] == rid), None)
     zid = s.get("cur_zone", {}).get("id", "")
-    if not rec: return
+    if not rec:
+        return
     await q.message.edit_text(
-        f"⚠️ <b>Confirm Delete</b>\n\n<code>{rec['type']}</code> | <code>{rec['name']}</code>\n→ <code>{rec['content']}</code>\n\n<b>This action cannot be undone!</b>",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[
+        f"⚠️ <b>Confirm Delete</b>\n\n"
+        f"<code>{h(rec['type'])}</code> | <code>{h(rec['name'])}</code>\n"
+        f"→ <code>{h(rec['content'])}</code>\n\n"
+        f"<b>This action cannot be undone!</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🗑 Yes, Delete", callback_data=f"dx_{rid}"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"dns_{zid}")]]))
+            InlineKeyboardButton("❌ Cancel", callback_data=f"dns_{zid}"),
+        ]]),
+    )
 
+
+@need_auth
 async def delete_execute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    uid = q.from_user.id; rid = q.data.replace("dx_", "")
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    rid = q.data.replace("dx_", "")
     zid = get_s(uid).get("cur_zone", {}).get("id", "")
     try:
         cf_del(uid, f"/zones/{zid}/dns_records/{rid}")
-        await q.message.edit_text("✅ Record deleted.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Records", callback_data=f"dns_{zid}")]]))
+        await q.message.edit_text(
+            "✅ Record deleted.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Records", callback_data=f"dns_{zid}")
+            ]]),
+        )
     except Exception as e:
-        await q.message.edit_text(f"❌ Error: <code>{e}</code>", parse_mode="HTML")
+        await q.message.edit_text(f"❌ Error: <code>{h(e)}</code>", parse_mode="HTML")
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  /disconnect
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@allowed_only
 async def cmd_disconnect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message or update.callback_query.message
     uid = update.effective_user.id
     if update.callback_query:
         await update.callback_query.answer()
     del_s(uid)
-    await msg.reply_text("🔌 <b>Disconnected.</b>\n\nYour Cloudflare session has been cleared.", parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Connect Again", callback_data="do_connect")]]))
+    await msg.reply_text(
+        "🔌 <b>Disconnected.</b>\n\nYour Cloudflare session has been cleared.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔐 Connect Again", callback_data="do_connect")
+        ]]),
+    )
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  /stats (admin only)
@@ -747,11 +1034,11 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     recent = ""
     for uid_str, info in sorted_users[:10]:
-        name = info.get("name", "?")
-        uname = f"@{info['username']}" if info.get("username") else ""
-        seen = info.get("last_seen", "?")[:10]
+        name = h(info.get("name", "?"))
+        uname = f"@{h(info['username'])}" if info.get("username") else ""
+        seen = h(info.get("last_seen", "?")[:10])
         cf = "✅" if uid_str in db.get("cf_logins", {}) else "❌"
-        recent += f"  {cf} <code>{uid_str}</code> {name} {uname} — {seen}\n"
+        recent += f"  {cf} <code>{h(uid_str)}</code> {name} {uname} — {seen}\n"
 
     text = (
         f"╭─❀ <b>KABUTIFLARE STATS</b> ❀─╮\n{DIV}\n\n"
@@ -762,6 +1049,7 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"<i>✅ = connected to CF | ❌ = not connected</i>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  /broadcast (admin only)
@@ -780,9 +1068,10 @@ async def broadcast_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Send the message you want to broadcast.\n"
         f"Supports text, photo, video, document.\n\n"
         f"/cancel to abort.",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     return BROADCAST_MSG
+
 
 async def broadcast_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -802,14 +1091,26 @@ async def broadcast_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if update.message.text:
                 await ctx.bot.send_message(chat_id, update.message.text, parse_mode="HTML")
             elif update.message.photo:
-                await ctx.bot.send_photo(chat_id, update.message.photo[-1].file_id,
-                    caption=update.message.caption or "", parse_mode="HTML")
+                await ctx.bot.send_photo(
+                    chat_id,
+                    update.message.photo[-1].file_id,
+                    caption=update.message.caption or "",
+                    parse_mode="HTML",
+                )
             elif update.message.video:
-                await ctx.bot.send_video(chat_id, update.message.video.file_id,
-                    caption=update.message.caption or "", parse_mode="HTML")
+                await ctx.bot.send_video(
+                    chat_id,
+                    update.message.video.file_id,
+                    caption=update.message.caption or "",
+                    parse_mode="HTML",
+                )
             elif update.message.document:
-                await ctx.bot.send_document(chat_id, update.message.document.file_id,
-                    caption=update.message.caption or "", parse_mode="HTML")
+                await ctx.bot.send_document(
+                    chat_id,
+                    update.message.document.file_id,
+                    caption=update.message.caption or "",
+                    parse_mode="HTML",
+                )
             else:
                 await ctx.bot.copy_message(chat_id, update.message.chat_id, update.message.message_id)
             sent += 1
@@ -830,25 +1131,25 @@ async def broadcast_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🚫 Blocked: <b>{blocked}</b>\n"
         f"❌ Failed: <b>{failed}</b>\n"
         f"📊 Total: <b>{total}</b>",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     return ConversationHandler.END
+
 
 async def broadcast_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Broadcast cancelled.")
     return ConversationHandler.END
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  /grantdeploy & /revokedeploy (admin only)
-#  Usage: /grantdeploy 123456789
-#         /revokedeploy 123456789
+#  /grantdeploy, /revokedeploy & /deploylist (admin only)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async def cmd_grantdeploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
         await update.message.reply_text(
             "⛔ <b>Access denied.</b>\n\nOnly the bot admin can manage deploy permissions.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
@@ -859,7 +1160,7 @@ async def cmd_grantdeploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{DIV}\n\n"
             "⚠️ <b>Usage:</b> <code>/grantdeploy USER_ID</code>\n\n"
             "<i>Example: /grantdeploy 123456789</i>",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
@@ -870,15 +1171,15 @@ async def cmd_grantdeploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{DIV}\n\n"
             f"⚠️ User <code>{target_uid}</code> is not in ALLOWED_USERS.\n\n"
             "Only allowed users can receive deploy access.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
     grant_deploy(target_uid)
     db = load_db()
     user_info = db.get("users", {}).get(str(target_uid), {})
-    name = user_info.get("name", "Unknown")
-    username = f"@{user_info['username']}" if user_info.get("username") else ""
+    name = h(user_info.get("name", "Unknown"))
+    username = f"@{h(user_info['username'])}" if user_info.get("username") else ""
 
     await update.message.reply_text(
         "╭─❀ <b>DEPLOY ACCESS GRANTED</b> ❀─╮\n"
@@ -887,15 +1188,16 @@ async def cmd_grantdeploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"👤 User: <b>{name}</b> {username}\n"
         f"🆔 ID: <code>{target_uid}</code>\n\n"
         f"🚀 They can now use <b>/deploy</b> to deploy to servers.",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
+
 
 async def cmd_revokedeploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
         await update.message.reply_text(
             "⛔ <b>Access denied.</b>\n\nOnly the bot admin can manage deploy permissions.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
@@ -906,7 +1208,7 @@ async def cmd_revokedeploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{DIV}\n\n"
             "⚠️ <b>Usage:</b> <code>/revokedeploy USER_ID</code>\n\n"
             "<i>Example: /revokedeploy 123456789</i>",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
@@ -916,24 +1218,24 @@ async def cmd_revokedeploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "╭─❀ <b>REVOKE DEPLOY</b> ❀─╮\n"
             f"{DIV}\n\n"
             "❌ <b>Cannot revoke admin's own deploy access.</b>",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
-    if target_uid not in DEPLOY_ALLOWED_USERS:
+    if target_uid not in get_deploy_allowed():
         await update.message.reply_text(
             "╭─❀ <b>REVOKE DEPLOY</b> ❀─╮\n"
             f"{DIV}\n\n"
             f"⚠️ User <code>{target_uid}</code> doesn't currently have deploy access.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
     revoke_deploy(target_uid)
     db = load_db()
     user_info = db.get("users", {}).get(str(target_uid), {})
-    name = user_info.get("name", "Unknown")
-    username = f"@{user_info['username']}" if user_info.get("username") else ""
+    name = h(user_info.get("name", "Unknown"))
+    username = f"@{h(user_info['username'])}" if user_info.get("username") else ""
 
     await update.message.reply_text(
         "╭─❀ <b>DEPLOY ACCESS REVOKED</b> ❀─╮\n"
@@ -942,39 +1244,41 @@ async def cmd_revokedeploy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"👤 User: <b>{name}</b> {username}\n"
         f"🆔 ID: <code>{target_uid}</code>\n\n"
         f"They can no longer use <b>/deploy</b>.",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
+
 
 async def cmd_deploylist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """List all users who currently have deploy access."""
     uid = update.effective_user.id
     if not is_admin(uid):
-        await update.message.reply_text(
-            "⛔ <b>Access denied.</b>", parse_mode="HTML"
-        )
+        await update.message.reply_text("⛔ <b>Access denied.</b>", parse_mode="HTML")
         return
 
     db = load_db()
+    deploy_users = sorted(get_deploy_allowed())
     lines = []
-    for dep_uid in sorted(DEPLOY_ALLOWED_USERS):
+    for dep_uid in deploy_users:
         user_info = db.get("users", {}).get(str(dep_uid), {})
-        name = user_info.get("name", "Unknown")
-        username = f"@{user_info['username']}" if user_info.get("username") else ""
+        name = h(user_info.get("name", "Unknown"))
+        username = f"@{h(user_info['username'])}" if user_info.get("username") else ""
         tag = " 👑 Admin" if dep_uid == ADMIN_ID else ""
         lines.append(f"  • <code>{dep_uid}</code> — <b>{name}</b> {username}{tag}")
 
     text = (
         "╭─❀ <b>DEPLOY ACCESS LIST</b> ❀─╮\n"
         f"{DIV}\n\n"
-        f"🚀 <b>{len(DEPLOY_ALLOWED_USERS)}</b> user(s) with deploy access:\n\n"
+        f"🚀 <b>{len(deploy_users)}</b> user(s) with deploy access:\n\n"
         + ("\n".join(lines) or "  No users.") + "\n\n"
         "<i>Use /grantdeploy ID or /revokedeploy ID to manage.</i>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  SSL/TLS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@need_auth
 async def ssl_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -987,27 +1291,59 @@ async def ssl_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parts = zid.split("_", 1)
         zid, mode = parts[0], parts[1]
         wait = await q.message.edit_text("⏳ Changing SSL mode...")
-        r = cf_patch(uid, f"/zones/{zid}/settings/ssl", {"value": mode})
-        if r.get("success"):
+        try:
+            r = cf_patch(uid, f"/zones/{zid}/settings/ssl", {"value": mode})
+            if r.get("success"):
+                await wait.edit_text(
+                    f"✅ SSL changed to <b>{h(mode)}</b>.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back", callback_data=f"ssl_{zid}")
+                    ]]),
+                )
+            else:
+                err = (r.get("errors") or [{}])[0].get("message", "Error")
+                await wait.edit_text(
+                    f"❌ <code>{h(err)}</code>",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back", callback_data=f"ssl_{zid}")
+                    ]]),
+                )
+        except Exception as e:
             await wait.edit_text(
-                f"✅ SSL changed to <b>{mode}</b>.",
+                f"❌ <code>{h(e)}</code>",
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"ssl_{zid}")]])
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back", callback_data=f"ssl_{zid}")
+                ]]),
             )
-        else:
-            err = r.get("errors", [{}])[0].get("message", "Error")
-            await wait.edit_text(f"❌ {err}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"ssl_{zid}")]]))
         return
 
     wait = await q.message.edit_text("⏳ Fetching SSL settings...")
-    r = cf_get(uid, f"/zones/{zid}/settings/ssl")
-    if not r.get("success"):
-        await wait.edit_text("❌ Error fetching SSL", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")]]))
+    try:
+        r = cf_get(uid, f"/zones/{zid}/settings/ssl")
+    except Exception as e:
+        await wait.edit_text(
+            f"❌ Error fetching SSL: <code>{h(e)}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")
+            ]]),
+        )
         return
 
     current = r["result"]["value"]
-    modes = {"off": "🔴 Off", "flexible": "🟡 Flexible", "full": "🟢 Full", "strict": "🔵 Full (Strict)"}
-    text = f"🔒 <b>SSL/TLS — {zone.get('name', '')}</b>\n\nCurrent mode: <b>{modes.get(current, current)}</b>\n\nSelect a mode:"
+    modes = {
+        "off": "🔴 Off",
+        "flexible": "🟡 Flexible",
+        "full": "🟢 Full",
+        "strict": "🔵 Full (Strict)",
+    }
+    text = (
+        f"🔒 <b>SSL/TLS — {h(zone.get('name', ''))}</b>\n\n"
+        f"Current mode: <b>{modes.get(current, h(current))}</b>\n\nSelect a mode:"
+    )
 
     btns = []
     for m, label in modes.items():
@@ -1019,37 +1355,47 @@ async def ssl_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await wait.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  NAMESERVERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@need_auth
 async def ns_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
     zid = q.data.replace("ns_", "")
-    s = get_s(uid)
-    zone = s.get("cur_zone", {})
 
     wait = await q.message.edit_text("⏳ Fetching nameservers...")
-    r = cf_get(uid, f"/zones/{zid}")
-    if not r.get("success"):
-        await wait.edit_text("❌ Error", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")]]))
+    try:
+        r = cf_get(uid, f"/zones/{zid}")
+    except Exception as e:
+        await wait.edit_text(
+            f"❌ Error: <code>{h(e)}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")
+            ]]),
+        )
         return
 
     z = r["result"]
     ns_list = z.get("name_servers", [])
     orig_ns = z.get("original_name_servers", [])
 
-    ns_txt = "\n".join(f"   <code>{n}</code>" for n in ns_list) or "—"
-    orig_txt = "\n".join(f"   <code>{n}</code>" for n in orig_ns) or "—"
+    ns_txt = "\n".join(f"   <code>{h(n)}</code>" for n in ns_list) or "—"
+    orig_txt = "\n".join(f"   <code>{h(n)}</code>" for n in orig_ns) or "—"
 
-    text = (f"📛 <b>Nameservers — {z.get('name', '')}</b>\n\n"
-            f"<b>☁️ Cloudflare Nameservers:</b>\n{ns_txt}\n\n"
-            f"<b>🏷 Original (Registrar):</b>\n{orig_txt}\n\n"
-            f"Status: <b>{z.get('status', '—')}</b>")
+    text = (
+        f"📛 <b>Nameservers — {h(z.get('name', ''))}</b>\n\n"
+        f"<b>☁️ Cloudflare Nameservers:</b>\n{ns_txt}\n\n"
+        f"<b>🏷 Original (Registrar):</b>\n{orig_txt}\n\n"
+        f"Status: <b>{h(z.get('status', '—'))}</b>"
+    )
 
     btns = [[InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")]]
     await wait.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  ZONE SETTINGS
@@ -1067,6 +1413,8 @@ ZONE_TOGGLES = [
     ("opportunistic_encryption",  "🔒 Opp. Encryption"),
 ]
 
+
+@need_auth
 async def zone_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1075,7 +1423,6 @@ async def zone_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_s(uid)
     zone = s.get("cur_zone", {})
 
-    # Toggle action: zst_{zid}_{index}
     if d.startswith("zst_"):
         parts = d.replace("zst_", "").rsplit("_", 1)
         zid, idx = parts[0], int(parts[1])
@@ -1086,28 +1433,26 @@ async def zone_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         wait = await q.message.edit_text(f"⏳ Toggling {label}…")
         r = cf_patch(uid, f"/zones/{zid}/settings/{key}", {"value": new_val})
         if r.get("success"):
-            # Update cache
             zs_cache[key] = new_val
             set_s(uid, {"zs_results": zs_cache})
             await wait.edit_text(
-                f"✅ <b>{label}</b> → <b>{new_val}</b>",
+                f"✅ <b>{h(label)}</b> → <b>{h(new_val)}</b>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔙 Back to Settings", callback_data=f"zs_{zid}")
-                ]])
+                ]]),
             )
         else:
             err = (r.get("errors") or [{}])[0].get("message", "Unknown error")
             await wait.edit_text(
-                f"❌ <b>{label}</b>\n<code>{err}</code>",
+                f"❌ <b>{h(label)}</b>\n<code>{h(err)}</code>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔙 Back", callback_data=f"zs_{zid}")
-                ]])
+                ]]),
             )
         return
 
-    # View settings: zs_{zid}
     zid = d.replace("zs_", "")
     wait = await q.message.edit_text("⏳ Fetching zone settings…")
     try:
@@ -1119,10 +1464,9 @@ async def zone_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 results[key] = "—"
 
-        # Cache results for toggle use
         set_s(uid, {"zs_results": results})
 
-        text = f"🌐 <b>Zone Settings — {zone.get('name', '')}</b>\n{DIV}\n\n"
+        text = f"🌐 <b>Zone Settings — {h(zone.get('name', ''))}</b>\n{DIV}\n\n"
         btns = []
         for idx, (key, label) in enumerate(ZONE_TOGGLES):
             val = results.get(key, "—")
@@ -1132,21 +1476,19 @@ async def zone_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 icon = "❌"
             else:
                 icon = "🔘"
-            text += f"{icon} {label}: <b>{val}</b>\n"
-            # callback: zst_{zid}_{index} — always under 64 chars
-            btns.append([InlineKeyboardButton(
-                f"{icon} {label}",
-                callback_data=f"zst_{zid}_{idx}"
-            )])
+            text += f"{icon} {h(label)}: <b>{h(val)}</b>\n"
+            btns.append([InlineKeyboardButton(f"{icon} {label}", callback_data=f"zst_{zid}_{idx}")])
 
         btns.append([InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")])
         await wait.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
     except Exception as e:
-        await wait.edit_text(f"❌ Error: <code>{e}</code>", parse_mode="HTML")
+        await wait.edit_text(f"❌ Error: <code>{h(e)}</code>", parse_mode="HTML")
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  PAGE RULES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@need_auth
 async def page_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1163,32 +1505,34 @@ async def page_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if not rules:
             await wait.edit_text(
-                f"📭 No page rules for <b>{zone.get('name','')}</b>.",
+                f"📭 No page rules for <b>{h(zone.get('name', ''))}</b>.",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("➕ Add Rule", callback_data=f"pradd_{zid}")],
                     [InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")],
-                ])
+                ]),
             )
             return
 
-        text = f"🔀 <b>Page Rules — {zone.get('name','')}</b>\n{len(rules)} rule(s)\n\n"
+        text = f"🔀 <b>Page Rules — {h(zone.get('name', ''))}</b>\n{len(rules)} rule(s)\n\n"
         btns = []
         for rule in rules:
             url = rule.get("targets", [{}])[0].get("constraint", {}).get("value", "?")
             status = "✅" if rule.get("status") == "active" else "⏸"
-            text += f"{status} <code>{url[:40]}</code>\n"
+            text += f"{status} <code>{h(url[:40])}</code>\n"
             btns.append([InlineKeyboardButton(f"{status} {url[:35]}", callback_data=f"pred_{rule['id']}")])
 
         btns.append([InlineKeyboardButton("➕ Add Rule", callback_data=f"pradd_{zid}")])
         btns.append([InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")])
         await wait.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
     except Exception as e:
-        await wait.edit_text(f"❌ Error: <code>{e}</code>", parse_mode="HTML")
+        await wait.edit_text(f"❌ Error: <code>{h(e)}</code>", parse_mode="HTML")
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  WORKERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@need_auth
 async def workers_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1204,32 +1548,32 @@ async def workers_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if not routes:
             await wait.edit_text(
-                f"📭 No worker routes for <b>{zone.get('name','')}</b>.",
+                f"📭 No worker routes for <b>{h(zone.get('name', ''))}</b>.",
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")]])
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")
+                ]]),
             )
             return
 
-        text = f"👷 <b>Workers — {zone.get('name','')}</b>\n{len(routes)} route(s)\n\n"
+        text = f"👷 <b>Workers — {h(zone.get('name', ''))}</b>\n{len(routes)} route(s)\n\n"
         btns = []
         for route in routes[:10]:
             pattern = route.get("pattern", "?")
             script = route.get("script", "—")
-            text += f"<code>{pattern[:35]}</code> → <b>{script}</b>\n"
+            text += f"<code>{h(pattern[:35])}</code> → <b>{h(script)}</b>\n"
             btns.append([InlineKeyboardButton(f"🔧 {pattern[:30]}", callback_data=f"wkr_{route['id']}")])
 
         btns.append([InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")])
         await wait.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
     except Exception as e:
-        await wait.edit_text(f"❌ Error: <code>{e}</code>", parse_mode="HTML")
+        await wait.edit_text(f"❌ Error: <code>{h(e)}</code>", parse_mode="HTML")
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  EMAIL ROUTING  (view · add rule · toggle rule · delete rule)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# Conversation states for adding an email rule
-EM_FROM, EM_TO = 200, 201
-
+@need_auth
 async def email_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Main email routing screen: status + list of rules."""
     q = update.callback_query
@@ -1254,19 +1598,15 @@ async def email_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # Store rules in session — use index in callbacks to avoid 64-char limit
         set_s(uid, {"em_rules": rules, "em_zid": zid})
-
-        # Color palette for rules — cycles through distinct emojis
         RULE_COLORS = ["🔵", "🟢", "🟡", "🟠", "🔴", "🟣", "🩷", "🔷", "🟤", "⚪"]
 
-        # Separate normal rules from catch-all (matcher type="all" or value missing)
         normal_rules = []
         catchall_rules = []
         for rule in rules:
             matchers = rule.get("matchers", [{}])
             m_type = matchers[0].get("type", "") if matchers else ""
-            m_val  = matchers[0].get("value", "") if matchers else ""
+            m_val = matchers[0].get("value", "") if matchers else ""
             if m_type == "all" or not m_val:
                 catchall_rules.append(rule)
             else:
@@ -1274,7 +1614,7 @@ async def email_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         text = (
             f"╭─❀ <b>EMAIL ROUTING</b> ❀─╮\n"
-            f"<i>{zone.get('name','')}</i>\n"
+            f"<i>{h(zone.get('name', ''))}</i>\n"
             f"{DIV}\n\n"
             f"Status: {status_icon} <b>{status_text}</b>\n"
             f"📋 <b>{len(rules)} rule(s)</b>\n"
@@ -1283,18 +1623,18 @@ async def email_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         btns = []
 
         if normal_rules:
-            text += f"\n<b>Forwarding Rules:</b>\n"
+            text += "\n<b>Forwarding Rules:</b>\n"
             for i, rule in enumerate(rules):
                 matchers = rule.get("matchers", [{}])
-                actions  = rule.get("actions",  [{}])
+                actions = rule.get("actions", [{}])
                 m_type = matchers[0].get("type", "") if matchers else ""
-                m_val  = matchers[0].get("value", "") if matchers else ""
+                m_val = matchers[0].get("value", "") if matchers else ""
                 if m_type == "all" or not m_val:
-                    continue  # skip catch-all here
+                    continue
                 a_val = (actions[0].get("value") or ["?"])[0] if actions else "?"
                 r_icon = "✅" if rule.get("enabled") else "⏸"
                 color = RULE_COLORS[i % len(RULE_COLORS)]
-                text += f"{color} {r_icon} <code>{m_val}</code> ↪ <code>{a_val}</code>\n"
+                text += f"{color} {r_icon} <code>{h(m_val)}</code> ↪ <code>{h(a_val)}</code>\n"
                 toggle_label = "⏸ Disable" if rule.get("enabled") else "▶️ Enable"
                 btns.append([
                     InlineKeyboardButton(f"{color} {toggle_label} {m_val}", callback_data=f"emtogr_{zid}_{i}"),
@@ -1302,17 +1642,17 @@ async def email_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ])
 
         if catchall_rules:
-            text += f"\n<b>Catch-All Rule:</b>\n"
+            text += "\n<b>Catch-All Rule:</b>\n"
             for rule in catchall_rules:
                 i = rules.index(rule)
                 actions = rule.get("actions", [{}])
-                a_type  = actions[0].get("type", "?") if actions else "?"
-                a_val   = (actions[0].get("value") or [""])[0] if actions else ""
-                r_icon  = "✅" if rule.get("enabled") else "⏸"
+                a_type = actions[0].get("type", "?") if actions else "?"
+                a_val = (actions[0].get("value") or [""])[0] if actions else ""
+                r_icon = "✅" if rule.get("enabled") else "⏸"
                 action_label = {
-                    "forward": f"Forward → <code>{a_val}</code>",
+                    "forward": f"Forward → <code>{h(a_val)}</code>",
                     "drop": "Drop (reject)",
-                }.get(a_type, a_type)
+                }.get(a_type, h(a_type))
                 text += f"🌐 {r_icon} {action_label}\n"
                 toggle_label = "⏸ Disable" if rule.get("enabled") else "▶️ Enable"
                 btns.append([
@@ -1329,9 +1669,10 @@ async def email_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         btns.append([InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")])
         await wait.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
     except Exception as e:
-        await wait.edit_text(f"❌ Error: <code>{e}</code>", parse_mode="HTML")
+        await wait.edit_text(f"❌ Error: <code>{h(e)}</code>", parse_mode="HTML")
 
 
+@need_auth
 async def email_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Step 1 — ask for the source (From) address."""
     q = update.callback_query
@@ -1347,9 +1688,9 @@ async def email_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{DIV}\n\n"
         f"<b>Step 1 of 2 — From address</b>\n\n"
         f"Send the <b>source email</b> on your domain:\n"
-        f"<i>Example: <code>hello@{zone_name}</code></i>\n\n"
+        f"<i>Example: <code>hello@{h(zone_name)}</code></i>\n\n"
         f"Type /cancel to abort.",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     return EM_FROM
 
@@ -1360,17 +1701,17 @@ async def email_add_from(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if "@" not in from_addr:
         await update.message.reply_text(
             "⚠️ That doesn't look like a valid email.\nSend a full email address:",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return EM_FROM
     ctx.user_data["em_from"] = from_addr
     await update.message.reply_text(
-        f"✅ <b>From:</b> <code>{from_addr}</code>\n\n"
+        f"✅ <b>From:</b> <code>{h(from_addr)}</code>\n\n"
         f"{DIV}\n"
         f"<b>Step 2 of 2 — Destination address</b>\n\n"
         f"Send the <b>destination email</b> to forward to:\n"
         f"<i>Example: <code>you@gmail.com</code></i>",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     return EM_TO
 
@@ -1381,12 +1722,12 @@ async def email_add_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if "@" not in to_addr:
         await update.message.reply_text(
             "⚠️ That doesn't look like a valid email.\nSend a full email address:",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return EM_TO
 
-    uid  = update.effective_user.id
-    zid  = ctx.user_data.get("em_zid", "")
+    uid = update.effective_user.id
+    zid = ctx.user_data.get("em_zid", "")
     from_addr = ctx.user_data.get("em_from", "")
 
     wait = await update.message.reply_text("⏳ Creating rule…")
@@ -1395,38 +1736,40 @@ async def email_add_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "enabled": True,
             "name": f"Forward {from_addr} → {to_addr}",
             "matchers": [{"field": "to", "type": "literal", "value": from_addr}],
-            "actions":  [{"type": "forward", "value": [to_addr]}],
+            "actions": [{"type": "forward", "value": [to_addr]}],
         }
         cf_post(uid, f"/zones/{zid}/email/routing/rules", body)
         await wait.edit_text(
             f"╭─❀ <b>RULE CREATED</b> ❀─╮\n"
             f"{DIV}\n\n"
             f"✅ <b>Forwarding rule added!</b>\n\n"
-            f"📨 <code>{from_addr}</code>\n"
-            f"   ↪ <code>{to_addr}</code>",
+            f"📨 <code>{h(from_addr)}</code>\n"
+            f"   ↪ <code>{h(to_addr)}</code>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📧 View Rules", callback_data=f"em_{zid}")],
                 [InlineKeyboardButton("➕ Add Another", callback_data=f"emadd_{zid}")],
-            ])
+            ]),
         )
     except Exception as e:
         await wait.edit_text(
-            f"❌ <b>Failed to create rule.</b>\n\n<code>{e}</code>\n\n"
+            f"❌ <b>Failed to create rule.</b>\n\n<code>{h(e)}</code>\n\n"
             f"<i>Tip: Make sure Email Routing is enabled and the destination\n"
             f"address has been verified in your Cloudflare dashboard.</i>",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"em_{zid}")]])
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"em_{zid}")
+            ]]),
         )
     return ConversationHandler.END
 
 
+@need_auth
 async def email_toggle_rule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Enable or disable a single email routing rule."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    # callback: emtogr_{zid}_{index}
     parts = q.data.replace("emtogr_", "").rsplit("_", 1)
     zid, idx = parts[0], int(parts[1])
 
@@ -1435,7 +1778,9 @@ async def email_toggle_rule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if idx >= len(rules):
         await q.message.edit_text(
             "❌ Rule not found. Please go back and refresh.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"em_{zid}")]])
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"em_{zid}")
+            ]]),
         )
         return
 
@@ -1449,24 +1794,26 @@ async def email_toggle_rule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "enabled": new_enabled,
             "name": rule.get("name", ""),
             "matchers": rule.get("matchers", []),
-            "actions":  rule.get("actions",  []),
+            "actions": rule.get("actions", []),
         }
         cf_put(uid, f"/zones/{zid}/email/routing/rules/{tag}", body)
         state = "✅ Enabled" if new_enabled else "⏸ Disabled"
         await wait.edit_text(
             f"Rule {state}.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"em_{zid}")]])
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"em_{zid}")
+            ]]),
         )
     except Exception as e:
-        await wait.edit_text(f"❌ Error: <code>{e}</code>", parse_mode="HTML")
+        await wait.edit_text(f"❌ Error: <code>{h(e)}</code>", parse_mode="HTML")
 
 
+@need_auth
 async def email_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Confirm before deleting a rule."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    # callback: emdel_{zid}_{index}
     parts = q.data.replace("emdel_", "").rsplit("_", 1)
     zid, idx = parts[0], int(parts[1])
 
@@ -1475,10 +1822,10 @@ async def email_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if idx < len(rules):
         rule = rules[idx]
         matchers = rule.get("matchers", [{}])
-        actions  = rule.get("actions",  [{}])
+        actions = rule.get("actions", [{}])
         from_v = matchers[0].get("value", "?") if matchers else "?"
-        to_v   = (actions[0].get("value") or ["?"])[0] if actions else "?"
-        detail = f"<code>{from_v}</code>\n   ↪ <code>{to_v}</code>"
+        to_v = (actions[0].get("value") or ["?"])[0] if actions else "?"
+        detail = f"<code>{h(from_v)}</code>\n   ↪ <code>{h(to_v)}</code>"
     else:
         detail = f"rule #{idx}"
 
@@ -1490,17 +1837,17 @@ async def email_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑 Yes, Delete", callback_data=f"emdelx_{zid}_{idx}"),
-             InlineKeyboardButton("❌ Cancel",      callback_data=f"em_{zid}")],
-        ])
+             InlineKeyboardButton("❌ Cancel", callback_data=f"em_{zid}")],
+        ]),
     )
 
 
+@need_auth
 async def email_delete_execute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Actually delete the rule."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    # callback: emdelx_{zid}_{index}
     parts = q.data.replace("emdelx_", "").rsplit("_", 1)
     zid, idx = parts[0], int(parts[1])
 
@@ -1509,7 +1856,9 @@ async def email_delete_execute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if idx >= len(rules):
         await q.message.edit_text(
             "❌ Rule not found. Go back and refresh.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"em_{zid}")]])
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"em_{zid}")
+            ]]),
         )
         return
 
@@ -1522,19 +1871,18 @@ async def email_delete_execute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await wait.edit_text(
             "✅ <b>Rule deleted.</b>",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📧 View Rules", callback_data=f"em_{zid}")]])
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📧 View Rules", callback_data=f"em_{zid}")
+            ]]),
         )
     except Exception as e:
-        await wait.edit_text(f"❌ Error: <code>{e}</code>", parse_mode="HTML")
+        await wait.edit_text(f"❌ Error: <code>{h(e)}</code>", parse_mode="HTML")
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  ANALYTICS
-#  Uses Cloudflare GraphQL Analytics API (v4 compatible).
-#  Shows last 24h traffic: requests, bandwidth, threats, cached %.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 def _fmt_bytes(b):
-    """Human-readable bytes."""
     if b >= 1_073_741_824:
         return f"{b / 1_073_741_824:.2f} GB"
     if b >= 1_048_576:
@@ -1543,38 +1891,36 @@ def _fmt_bytes(b):
         return f"{b / 1024:.1f} KB"
     return f"{b} B"
 
+
 def _fmt_num(n):
-    """Human-readable large numbers."""
     if n >= 1_000_000:
         return f"{n / 1_000_000:.2f}M"
     if n >= 1_000:
         return f"{n / 1_000:.1f}K"
     return str(n)
 
+
 def _cf_analytics_zone(uid, zid):
-    """
-    Fetch zone analytics via Cloudflare v4 REST endpoint (last 24 h).
-    Returns dict with requests, bandwidth, threats, pageviews, cached info.
-    """
-    from datetime import timezone, timedelta
     now = datetime.now(timezone.utc)
     since = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
     until = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Use the v4 analytics/dashboard endpoint
     try:
-        d = cf_get(uid, f"/zones/{zid}/analytics/dashboard",
-                   {"since": since, "until": until, "continuous": "false"})
+        d = cf_get(
+            uid,
+            f"/zones/{zid}/analytics/dashboard",
+            {"since": since, "until": until, "continuous": "false"},
+        )
         totals = d.get("result", {}).get("totals", {})
-        requests = totals.get("requests", {})
+        reqs = totals.get("requests", {})
         bandwidth = totals.get("bandwidth", {})
         threats = totals.get("threats", {})
         pageviews = totals.get("pageviews", {})
         uniq = totals.get("uniques", {})
 
-        total_req = requests.get("all", 0)
-        cached_req = requests.get("cached", 0)
-        uncached_req = requests.get("uncached", 0)
+        total_req = reqs.get("all", 0)
+        cached_req = reqs.get("cached", 0)
+        uncached_req = reqs.get("uncached", 0)
         cache_pct = round((cached_req / total_req * 100) if total_req > 0 else 0, 1)
 
         total_bw = bandwidth.get("all", 0)
@@ -1585,15 +1931,13 @@ def _cf_analytics_zone(uid, zid):
         pv_total = pageviews.get("all", 0)
         visitors = uniq.get("all", 0)
 
-        # Top countries from timeseries if available
         by_country = {}
         for bucket in d.get("result", {}).get("timeseries", []):
             for c, v in bucket.get("requests", {}).get("country", {}).items():
                 by_country[c] = by_country.get(c, 0) + v
         top_countries = sorted(by_country.items(), key=lambda x: x[1], reverse=True)[:5]
 
-        # HTTP status breakdown
-        status_map = requests.get("http_status", {})
+        status_map = reqs.get("http_status", {})
 
         return {
             "ok": True,
@@ -1613,6 +1957,8 @@ def _cf_analytics_zone(uid, zid):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+
+@need_auth
 async def zone_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Show analytics for a specific zone (last 24 hours)."""
     q = update.callback_query
@@ -1624,8 +1970,8 @@ async def zone_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     zone_name = zone.get("name", zid)
 
     wait = await q.message.edit_text(
-        f"⏳ Fetching analytics for <b>{zone_name}</b>…",
-        parse_mode="HTML"
+        f"⏳ Fetching analytics for <b>{h(zone_name)}</b>…",
+        parse_mode="HTML",
     )
 
     loop = asyncio.get_event_loop()
@@ -1635,37 +1981,34 @@ async def zone_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await wait.edit_text(
             f"╭─❀ <b>ANALYTICS</b> ❀─╮\n{DIV}\n\n"
             f"❌ <b>Could not fetch analytics.</b>\n\n"
-            f"<code>{data['error']}</code>\n\n"
+            f"<code>{h(data['error'])}</code>\n\n"
             "<i>Note: Analytics require a zone with at least some traffic, "
             "and your API token needs Zone · Analytics · Read permission.</i>",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")]
-            ])
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")
+            ]]),
         )
         return
 
-    # Build country list
     country_lines = ""
     for code, count in data["top_countries"]:
-        country_lines += f"  🌍 <b>{code}</b> — {_fmt_num(count)} req\n"
+        country_lines += f"  🌍 <b>{h(code)}</b> — {_fmt_num(count)} req\n"
     if not country_lines:
         country_lines = "  <i>No country data</i>\n"
 
-    # HTTP status breakdown
     status_lines = ""
     for code, count in sorted(data["status_map"].items(), key=lambda x: -x[1])[:5]:
         icon = "✅" if str(code).startswith("2") else ("⚠️" if str(code).startswith("3") else "❌")
-        status_lines += f"  {icon} <b>HTTP {code}</b> — {_fmt_num(count)}\n"
+        status_lines += f"  {icon} <b>HTTP {h(code)}</b> — {_fmt_num(count)}\n"
     if not status_lines:
         status_lines = "  <i>No status data</i>\n"
 
-    # Threat level
     threat_icon = "🛡️" if data["threats"] == 0 else ("⚠️" if data["threats"] < 100 else "🚨")
 
     text = (
         f"╭─❀ <b>ANALYTICS</b> ❀─╮\n"
-        f"<i>{zone_name} — Last 24 hours</i>\n"
+        f"<i>{h(zone_name)} — Last 24 hours</i>\n"
         f"{DIV}\n\n"
         f"🌐 <b>Traffic Overview</b>\n"
         f"  📥 Requests: <b>{_fmt_num(data['total_req'])}</b>\n"
@@ -1689,8 +2032,10 @@ async def zone_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ]
     await wait.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
+
+@need_auth
 async def global_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show a quick analytics summary across all zones."""
+    """Show a zone picker for analytics."""
     if update.callback_query:
         await update.callback_query.answer()
         msg = update.callback_query.message
@@ -1699,24 +2044,9 @@ async def global_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg = update.message
         uid = update.effective_user.id
 
-    if uid not in ALLOWED_USERS:
-        await msg.reply_text("⛔ <b>Access denied.</b>", parse_mode="HTML")
-        return
-
     s = get_s(uid)
-    if not s.get("key"):
-        await msg.reply_text(
-            "🔒 Connect your Cloudflare account first.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔐 Connect", callback_data="do_connect")
-            ]])
-        )
-        return
-
     zones = s.get("zones", [])
     if not zones:
-        # Try to fetch zones first
         wait = await msg.reply_text("⏳ Fetching zones…")
         try:
             all_zones = []
@@ -1730,7 +2060,7 @@ async def global_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             set_s(uid, {"zones": all_zones})
             zones = all_zones
         except Exception as e:
-            await wait.edit_text(f"❌ Error fetching zones: <code>{e}</code>", parse_mode="HTML")
+            await wait.edit_text(f"❌ Error fetching zones: <code>{h(e)}</code>", parse_mode="HTML")
             return
         await wait.delete()
 
@@ -1738,12 +2068,11 @@ async def global_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("📭 No domains found.", parse_mode="HTML")
         return
 
-    # Show zone picker for analytics
     text = (
         f"╭─❀ <b>ANALYTICS</b> ❀─╮\n"
         f"{DIV}\n\n"
         f"📊 Select a domain to view analytics:\n\n"
-        f"<i>Shows traffic, cache, bandwidth & threats\nfor the last 24 hours.</i>"
+        f"<i>Shows traffic, cache, bandwidth &amp; threats\nfor the last 24 hours.</i>"
     )
     ico = {"active": "🟢", "pending": "🟡", "moved": "🔴", "deactivated": "🔴"}
     btns = []
@@ -1757,14 +2086,9 @@ async def global_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await msg.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  DEPLOY TO SERVER (via SSH)
-#
-#  Design note: every step in this conversation uses a plain TEXT
-#  reply — never an inline button — except the very first entry
-#  point. This guarantees the flow can never "skip" a step because
-#  a callback got intercepted elsewhere; MessageHandlers inside an
-#  active ConversationHandler state always take priority.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DEPLOY_SCRIPT = '''#!/bin/bash
 set -e
@@ -1803,6 +2127,7 @@ docker compose ps
 echo "DEPLOY_OK"
 '''
 
+
 def _ssh_connect(host, port, user, auth_method, password, key_data):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -1831,8 +2156,10 @@ def _ssh_connect(host, port, user, auth_method, password, key_data):
     client.connect(**connect_args)
     return client
 
+
 def _ssh_deploy(host, port, user, auth_method, password, key_data, bot_token, webapp_url):
     """Runs entirely in a thread executor — safe blocking SSH call."""
+    client = None
     try:
         client = _ssh_connect(host, port, user, auth_method, password, key_data)
         script = DEPLOY_SCRIPT.format(
@@ -1846,14 +2173,20 @@ def _ssh_deploy(host, port, user, auth_method, password, key_data, bot_token, we
         exit_code = stdout.channel.recv_exit_status()
         out = stdout.read().decode("utf-8", errors="replace")
         err = stderr.read().decode("utf-8", errors="replace")
-        client.close()
         if exit_code == 0 and "DEPLOY_OK" in out:
             return {"success": True, "output": out}
         return {"success": False, "error": f"Exit code: {exit_code}\n{err}\n{out}"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
-# ── Entry point ──────────────────────────────────────────────
+
+@allowed_only
 async def deploy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer()
@@ -1867,11 +2200,10 @@ async def deploy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{DIV}\n\n"
             "⚠️ The <code>paramiko</code> library is missing.\n\n"
             "Install it with:\n<code>pip install paramiko</code>",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return ConversationHandler.END
 
-    # ── Deploy access check ──────────────────────────────────
     uid = update.effective_user.id if update.effective_user else None
     if uid is None or not has_deploy_access(uid):
         await msg.reply_text(
@@ -1882,11 +2214,10 @@ async def deploy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📩 Request Access", url=f"tg://user?id={ADMIN_ID}")
-            ]])
+            ]]),
         )
         return ConversationHandler.END
 
-    # Reset any stale deploy data from a previous attempt
     for k in list(ctx.user_data.keys()):
         if k.startswith("dep_"):
             ctx.user_data.pop(k, None)
@@ -1911,7 +2242,7 @@ async def deploy_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(text, parse_mode="HTML")
     return DEP_HOST
 
-# ── Step 1: Host ─────────────────────────────────────────────
+
 async def deploy_host(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     host = update.message.text.strip()
     if not host:
@@ -1919,15 +2250,15 @@ async def deploy_host(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return DEP_HOST
     ctx.user_data["dep_host"] = host
     await update.message.reply_text(
-        f"✅ <b>Server:</b> <code>{host}</code>\n\n"
+        f"✅ <b>Server:</b> <code>{h(host)}</code>\n\n"
         f"{DIV}\n"
         "<b>Step 2 of 6 — SSH Port</b>\n\n"
         "Send the SSH port (default is <code>22</code>):",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     return DEP_PORT
 
-# ── Step 2: Port ─────────────────────────────────────────────
+
 async def deploy_port(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
     try:
@@ -1940,11 +2271,11 @@ async def deploy_port(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{DIV}\n"
         "<b>Step 3 of 6 — SSH Username</b>\n\n"
         "Send the SSH username (usually <code>root</code>):",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     return DEP_USER
 
-# ── Step 3: Username ─────────────────────────────────────────
+
 async def deploy_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.message.text.strip()
     if not user:
@@ -1952,41 +2283,42 @@ async def deploy_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return DEP_USER
     ctx.user_data["dep_user"] = user
     await update.message.reply_text(
-        f"✅ <b>Username:</b> <code>{user}</code>\n\n"
+        f"✅ <b>Username:</b> <code>{h(user)}</code>\n\n"
         f"{DIV}\n"
         "<b>Step 4 of 6 — Authentication</b>\n\n"
         "How do you want to authenticate?\n\n"
         "  Reply <b>1</b> → Password\n"
         "  Reply <b>2</b> → SSH Key",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     return DEP_AUTH
 
-# ── Step 4: Auth method (text-based — never a button) ───────
+
 async def deploy_auth_method(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     choice = update.message.text.strip()
     if choice == "2":
         ctx.user_data["dep_auth_method"] = "key"
         await update.message.reply_text(
             "🔐 <b>SSH Key</b>\n\nUpload your private key file, or paste its contents directly:",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return DEP_KEY
     elif choice == "1":
         ctx.user_data["dep_auth_method"] = "pass"
         await update.message.reply_text(
-            "🔑 <b>Password</b>\n\nSend the SSH password:\n\n<i>⚠️ Your message will be deleted immediately.</i>",
-            parse_mode="HTML"
+            "🔑 <b>Password</b>\n\nSend the SSH password:\n\n"
+            "<i>⚠️ Your message will be deleted immediately.</i>",
+            parse_mode="HTML",
         )
         return DEP_PASS
     else:
         await update.message.reply_text(
             "⚠️ Please reply with <b>1</b> (Password) or <b>2</b> (SSH Key):",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return DEP_AUTH
 
-# ── Step 5a: Password ────────────────────────────────────────
+
 async def deploy_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["dep_password"] = update.message.text.strip()
     try:
@@ -1999,11 +2331,11 @@ async def deploy_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<b>Step 5 of 6 — Bot Token</b>\n\n"
         "Send the <b>Bot Token</b> for the bot you're deploying\n"
         "<i>(get one from @BotFather)</i>:",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     return DEP_BOTTOKEN
 
-# ── Step 5b: SSH Key ─────────────────────────────────────────
+
 async def deploy_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message.document:
         f = await update.message.document.get_file()
@@ -2021,18 +2353,18 @@ async def deploy_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<b>Step 5 of 6 — Bot Token</b>\n\n"
         "Send the <b>Bot Token</b> for the bot you're deploying\n"
         "<i>(get one from @BotFather)</i>:",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     return DEP_BOTTOKEN
 
-# ── Step 6: Bot Token ────────────────────────────────────────
+
 async def deploy_bottoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     token = update.message.text.strip()
     if ":" not in token:
         await update.message.reply_text(
             "⚠️ That doesn't look like a valid bot token. It should look like "
             "<code>123456789:ABCdefGhIJKlmNoPQRstuVwxyZ</code>.\n\nTry again:",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return DEP_BOTTOKEN
     ctx.user_data["dep_bottoken"] = token
@@ -2046,11 +2378,11 @@ async def deploy_bottoken(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<b>Step 6 of 6 — Mini App URL</b>\n\n"
         "Send your WebApp / Mini App URL,\n"
         "or send <code>skip</code> if you don't need one:",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     return DEP_WEBAPP
 
-# ── Final step: confirm + run deploy ────────────────────────
+
 async def deploy_webapp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     webapp = update.message.text.strip()
     if webapp.lower() == "skip":
@@ -2067,11 +2399,11 @@ async def deploy_webapp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     wait = await update.message.reply_text(
         f"╭─❀ <b>DEPLOYING</b> ❀─╮\n{DIV}\n\n"
-        f"🖥 Server: <code>{user}@{host}:{port}</code>\n"
+        f"🖥 Server: <code>{h(user)}@{h(host)}:{port}</code>\n"
         f"🔑 Auth: {'Password' if auth_method == 'pass' else 'SSH Key'}\n\n"
         f"⏳ <b>Connecting via SSH...</b>\n"
         f"<i>This usually takes 2–5 minutes. Please wait.</i>",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
     result = await asyncio.get_event_loop().run_in_executor(
@@ -2082,13 +2414,13 @@ async def deploy_webapp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await wait.edit_text(
             f"╭─❀ <b>DEPLOYMENT SUCCESSFUL</b> ❀─╮\n{DIV}\n\n"
             f"✅ KabutiFlare is now running on your server!\n\n"
-            f"🖥 Server: <code>{host}</code>\n"
+            f"🖥 Server: <code>{h(host)}</code>\n"
             f"📁 Path: <code>/opt/kabutiflare</code>\n"
             f"🐳 Status: Running (Docker)\n\n"
             f"🔧 <b>Useful commands:</b>\n"
             f"<code>docker compose -f /opt/kabutiflare/docker-compose.yml logs -f</code>\n"
             f"<code>docker compose -f /opt/kabutiflare/docker-compose.yml restart</code>",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     else:
         err = result["error"][:1200]
@@ -2103,13 +2435,14 @@ async def deploy_webapp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif "name or service not known" in low or "nodename" in low:
             tip = "\n\n💡 <b>Tip:</b> The hostname/IP couldn't be resolved. Check for typos."
         await wait.edit_text(
-            f"╭─❀ <b>DEPLOYMENT FAILED</b> ❀─╮\n{DIV}\n\n❌ <pre>{err}</pre>{tip}",
-            parse_mode="HTML"
+            f"╭─❀ <b>DEPLOYMENT FAILED</b> ❀─╮\n{DIV}\n\n❌ <pre>{h(err)}</pre>{tip}",
+            parse_mode="HTML",
         )
 
     for k in ["dep_password", "dep_key_data", "dep_bottoken"]:
         ctx.user_data.pop(k, None)
     return ConversationHandler.END
+
 
 async def deploy_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for k in list(ctx.user_data.keys()):
@@ -2118,12 +2451,11 @@ async def deploy_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Deploy cancelled.")
     return ConversationHandler.END
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  MISC
+#  PAGE RULE — ADD, DETAIL & DELETE
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  PAGE RULE — ADD & DETAIL  (previously missing handlers)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@need_auth
 async def page_rule_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Inform user to add page rules via Cloudflare dashboard (API deprecated)."""
     q = update.callback_query
@@ -2136,14 +2468,16 @@ async def page_rule_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"╭─❀ <b>ADD PAGE RULE</b> ❀─╮\n{DIV}\n\n"
         f"⚠️ Cloudflare has deprecated the Page Rules API.\n\n"
         f"To add a new rule, please use the dashboard:\n"
-        f"<a href='https://dash.cloudflare.com/?to=/:account/{zone_name}/rules'>Open Cloudflare Rules for {zone_name}</a>",
+        f"<a href='https://dash.cloudflare.com/?to=/:account/{h(zone_name)}/rules'>Open Cloudflare Rules for {h(zone_name)}</a>",
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔙 Back", callback_data=f"pr_{zid}")
-        ]])
+        ]]),
     )
 
+
+@need_auth
 async def page_rule_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Show detail + delete option for a page rule."""
     q = update.callback_query
@@ -2157,7 +2491,9 @@ async def page_rule_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not rule:
         await q.message.edit_text(
             "❌ Rule not found. Go back and refresh.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"pr_{zid}")]])
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"pr_{zid}")
+            ]]),
         )
         return
     url = rule.get("targets", [{}])[0].get("constraint", {}).get("value", "?")
@@ -2165,27 +2501,27 @@ async def page_rule_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     actions_txt = ""
     for a in rule.get("actions", []):
         aname = a.get("id", "?").replace("_", " ").title()
-        aval  = a.get("value", "")
+        aval = a.get("value", "")
         if isinstance(aval, dict):
             aval = ", ".join(f"{k}={v}" for k, v in aval.items())
-        actions_txt += f"  • {aname}: <code>{aval}</code>\n"
+        actions_txt += f"  • {h(aname)}: <code>{h(aval)}</code>\n"
     text = (
         f"🔀 <b>Page Rule</b>\n{DIV}\n\n"
-        f"🔗 <code>{url}</code>\n"
+        f"🔗 <code>{h(url)}</code>\n"
         f"Status: {status}\n\n"
         f"<b>Actions:</b>\n{actions_txt or '  —'}"
     )
     await q.message.edit_text(
-        text, parse_mode="HTML",
+        text,
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑 Delete Rule", callback_data=f"prdel_{rid}")],
             [InlineKeyboardButton("🔙 Back", callback_data=f"pr_{zid}")],
-        ])
+        ]),
     )
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  WORKER ROUTE — DETAIL  (previously missing handler)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@need_auth
 async def page_rule_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Delete a page rule."""
     q = update.callback_query
@@ -2198,15 +2534,26 @@ async def page_rule_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         cf_del(uid, f"/zones/{zid}/pagerules/{rid}")
         await wait.edit_text(
-            "✅ <b>Page rule deleted.</b>", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"pr_{zid}")]])
+            "✅ <b>Page rule deleted.</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"pr_{zid}")
+            ]]),
         )
     except Exception as e:
         await wait.edit_text(
-            f"❌ Error: <code>{e}</code>", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"pr_{zid}")]])
+            f"❌ Error: <code>{h(e)}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"pr_{zid}")
+            ]]),
         )
 
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  WORKER ROUTE — DETAIL & DELETE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@need_auth
 async def worker_route_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Delete a worker route."""
     q = update.callback_query
@@ -2219,15 +2566,23 @@ async def worker_route_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         cf_del(uid, f"/zones/{zid}/workers/routes/{rid}")
         await wait.edit_text(
-            "✅ <b>Worker route deleted.</b>", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"wk_{zid}")]])
+            "✅ <b>Worker route deleted.</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"wk_{zid}")
+            ]]),
         )
     except Exception as e:
         await wait.edit_text(
-            f"❌ Error: <code>{e}</code>", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"wk_{zid}")]])
+            f"❌ Error: <code>{h(e)}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"wk_{zid}")
+            ]]),
         )
 
+
+@need_auth
 async def worker_route_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Show worker route detail with delete option."""
     q = update.callback_query
@@ -2236,40 +2591,44 @@ async def worker_route_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rid = q.data.replace("wkr_", "")
     s = get_s(uid)
     zid = s.get("cur_zone", {}).get("id", "")
-    zone = s.get("cur_zone", {})
     wait = await q.message.edit_text("⏳ Fetching route details…")
     try:
         d = cf_get(uid, f"/zones/{zid}/workers/routes/{rid}")
         route = d["result"]
         pattern = route.get("pattern", "?")
-        script  = route.get("script", "—") or "— (no script)"
+        script = route.get("script", "—") or "— (no script)"
         text = (
             f"🔧 <b>Worker Route</b>\n{DIV}\n\n"
-            f"🌐 Pattern: <code>{pattern}</code>\n"
-            f"👷 Script: <b>{script}</b>\n"
+            f"🌐 Pattern: <code>{h(pattern)}</code>\n"
+            f"👷 Script: <b>{h(script)}</b>\n"
         )
         await wait.edit_text(
-            text, parse_mode="HTML",
+            text,
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🗑 Delete Route", callback_data=f"wkrdel_{rid}")],
                 [InlineKeyboardButton("🔙 Back", callback_data=f"wk_{zid}")],
-            ])
+            ]),
         )
     except Exception as e:
         await wait.edit_text(
-            f"❌ Error: <code>{e}</code>", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"wk_{zid}")]])
+            f"❌ Error: <code>{h(e)}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"wk_{zid}")
+            ]]),
         )
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  EMAIL ROUTING — TOGGLE WHOLE ROUTING ON/OFF (previously missing)
+#  EMAIL ROUTING — TOGGLE WHOLE ROUTING ON/OFF
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@need_auth
 async def email_toggle_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Enable or disable email routing entirely for a zone."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    # callback: emtog_{zid}_{enable|disable}
     parts = q.data.replace("emtog_", "").rsplit("_", 1)
     zid, action = parts[0], parts[1]
     enable = action == "enable"
@@ -2284,17 +2643,22 @@ async def email_toggle_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Email Routing {state}.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📧 View Routing", callback_data=f"em_{zid}")
-            ]])
+            ]]),
         )
     except Exception as e:
         await wait.edit_text(
-            f"❌ Error: <code>{e}</code>", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"em_{zid}")]])
+            f"❌ Error: <code>{h(e)}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"em_{zid}")
+            ]]),
         )
+
 
 async def noop_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer()
+
 
 async def post_init(app):
     commands = [
@@ -2321,14 +2685,13 @@ async def post_init(app):
         except Exception:
             pass
 
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  MAIN
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # ── Deploy conversation (registered FIRST so its states always
-    #    win priority over any standalone callback/message handler) ──
     deploy_conv = ConversationHandler(
         entry_points=[
             CommandHandler("deploy", deploy_start),
@@ -2355,7 +2718,7 @@ def main():
         per_user=True,
         per_message=False,
         allow_reentry=True,
-        conversation_timeout=900,  # auto-expire after 15 min of inactivity
+        conversation_timeout=900,
     )
 
     connect_conv = ConversationHandler(
@@ -2409,13 +2772,12 @@ def main():
         entry_points=[CallbackQueryHandler(email_add_start, pattern="^emadd_")],
         states={
             EM_FROM: [MessageHandler(filters.TEXT & ~filters.COMMAND, email_add_from)],
-            EM_TO:   [MessageHandler(filters.TEXT & ~filters.COMMAND, email_add_to)],
+            EM_TO: [MessageHandler(filters.TEXT & ~filters.COMMAND, email_add_to)],
         },
         fallbacks=[CommandHandler("cancel", connect_cancel_msg)],
         allow_reentry=True,
     )
 
-    # Order matters: deploy_conv first, then the rest
     app.add_handler(deploy_conv)
     app.add_handler(connect_conv)
     app.add_handler(add_conv)
@@ -2434,8 +2796,6 @@ def main():
     app.add_handler(CommandHandler("revokedeploy", cmd_revokedeploy))
     app.add_handler(CommandHandler("deploylist", cmd_deploylist))
 
-    # Specific callback handlers (kept explicit — no catch-all router,
-    # so nothing can ever accidentally intercept a conversation step)
     app.add_handler(CallbackQueryHandler(cmd_domains, pattern="^do_domains$"))
     app.add_handler(CallbackQueryHandler(cmd_disconnect, pattern="^do_disconnect$"))
     app.add_handler(CallbackQueryHandler(send_help, pattern="^do_help$"))
@@ -2460,20 +2820,19 @@ def main():
     app.add_handler(CallbackQueryHandler(email_delete_confirm, pattern="^emdel_"))
     app.add_handler(CallbackQueryHandler(email_delete_execute, pattern="^emdelx_"))
     app.add_handler(CallbackQueryHandler(noop_handler, pattern="^noop$"))
-
-    # ── Previously missing handlers ──────────────────────────
-    app.add_handler(CallbackQueryHandler(page_rule_add,    pattern="^pradd_"))
+    app.add_handler(CallbackQueryHandler(page_rule_add, pattern="^pradd_"))
     app.add_handler(CallbackQueryHandler(page_rule_detail, pattern="^pred_"))
     app.add_handler(CallbackQueryHandler(page_rule_delete, pattern="^prdel_"))
-    app.add_handler(CallbackQueryHandler(worker_route_detail,  pattern="^wkr_"))
-    app.add_handler(CallbackQueryHandler(worker_route_delete,  pattern="^wkrdel_"))
+    app.add_handler(CallbackQueryHandler(worker_route_detail, pattern="^wkr_"))
+    app.add_handler(CallbackQueryHandler(worker_route_delete, pattern="^wkrdel_"))
     app.add_handler(CallbackQueryHandler(email_toggle_routing, pattern="^emtog_"))
 
     logger.info("🚀 KabutiFlare bot started.")
     app.run_polling(
         allowed_updates=["message", "callback_query", "inline_query", "chat_member", "my_chat_member"],
-        drop_pending_updates=True
+        drop_pending_updates=True,
     )
+
 
 if __name__ == "__main__":
     main()
