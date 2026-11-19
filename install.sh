@@ -65,6 +65,64 @@ cf_get() {
     curl -sS --connect-timeout 8 --max-time 15 --config - 2>/dev/null || true
 }
 
+# ── Smart Docker check: install Docker and/or Compose only if missing ───────
+DC=""
+ensure_docker() {
+  if command -v docker &>/dev/null; then
+    echo -e "${GREEN}✅ Docker found: $(docker --version 2>/dev/null)${NC}"
+  else
+    echo -e "${YELLOW}📦 Docker not found — installing...${NC}"
+    if ! curl -fsSL https://get.docker.com | sh; then
+      echo -e "${RED}❌ Docker installation failed. Install it manually and run again.${NC}"
+      exit 1
+    fi
+  fi
+
+  # make sure the daemon is running
+  systemctl enable --now docker >/dev/null 2>&1 || service docker start >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5; do docker info >/dev/null 2>&1 && break; sleep 2; done
+  if ! docker info >/dev/null 2>&1; then
+    echo -e "${RED}❌ Docker daemon is not running. Try: systemctl start docker${NC}"
+    exit 1
+  fi
+
+  # Compose: plugin (v2) → standalone → apt → direct download
+  if docker compose version >/dev/null 2>&1; then
+    DC="docker compose"
+  elif command -v docker-compose >/dev/null 2>&1 && docker-compose version >/dev/null 2>&1; then
+    DC="docker-compose"
+  else
+    echo -e "${YELLOW}📦 Docker Compose not found — installing...${NC}"
+    apt-get update -qq >/dev/null 2>&1 || true
+    for pkg in docker-compose-plugin docker-compose-v2; do
+      apt-get install -y -qq "$pkg" >/dev/null 2>&1 || true
+      docker compose version >/dev/null 2>&1 && break
+    done
+    if ! docker compose version >/dev/null 2>&1; then
+      case "$(uname -m)" in
+        x86_64|amd64)  CARCH="x86_64" ;;
+        aarch64|arm64) CARCH="aarch64" ;;
+        armv7l)        CARCH="armv7" ;;
+        *)             CARCH="" ;;
+      esac
+      if [ -n "$CARCH" ]; then
+        mkdir -p /usr/local/lib/docker/cli-plugins
+        if curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${CARCH}" \
+             -o /usr/local/lib/docker/cli-plugins/docker-compose; then
+          chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+        fi
+      fi
+    fi
+    if docker compose version >/dev/null 2>&1; then
+      DC="docker compose"
+    else
+      echo -e "${RED}❌ Could not install Docker Compose. Use the Systemd method (2) instead.${NC}"
+      exit 1
+    fi
+  fi
+  echo -e "${GREEN}✅ Compose ready: ${DC}${NC}"
+}
+
 # ── Stop legacy service (prevents 409 Conflict) ─────────────────────────────
 if systemctl list-unit-files 2>/dev/null | grep -q "cf-failover-telegram.service"; then
   echo -e "${YELLOW}⚠️  Old cf-failover-telegram service found — disabling...${NC}"
@@ -258,22 +316,15 @@ fi
 if [ "$METHOD" = "1" ]; then
   echo -e "\n${CYAN}🐳 Building & starting with Docker...${NC}"
 
-  if ! command -v docker &>/dev/null; then
-    echo -e "${YELLOW}📦 Installing Docker...${NC}"
-    curl -fsSL https://get.docker.com | sh
-  fi
-  if ! docker compose version &>/dev/null 2>&1; then
-    echo -e "${YELLOW}📦 Installing Docker Compose plugin...${NC}"
-    apt-get update -qq && apt-get install -y -qq docker-compose-plugin 2>/dev/null || true
-  fi
+  ensure_docker
 
   systemctl disable --now kabutiflare 2>/dev/null || true   # avoid double polling if migrating
-  docker compose down 2>/dev/null || true
-  docker compose up -d --build
+  $DC down 2>/dev/null || true
+  $DC up -d --build
 
   sleep 5
   echo -e "\n${CYAN}📜 Last logs:${NC}"
-  docker compose logs --tail 12 2>/dev/null || true
+  $DC logs --tail 12 2>/dev/null || true
 
   echo -e "\n${GREEN}✅ KabutiFlare deployed with Docker!${NC}"
   echo -e "📁 Directory : ${CYAN}$DIR${NC}"
@@ -311,7 +362,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-  if command -v docker &>/dev/null; then
+  if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
     (cd "$DIR" && docker compose down 2>/dev/null) || true   # avoid double polling if migrating
   fi
   systemctl daemon-reload
