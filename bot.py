@@ -5,6 +5,7 @@ Manage Cloudflare DNS, SSL, Workers, Page Rules & Email Routing from Telegram.
 
 import os
 import json
+import math
 import logging
 import socket
 import requests
@@ -42,6 +43,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip()
 CF_API = "https://api.cloudflare.com/client/v4"
+CF_GRAPHQL = "https://api.cloudflare.com/client/v4/graphql"
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "474008580").strip())
 
@@ -59,6 +61,7 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is required. Set via environment variable or .env file.")
 
 DIV = "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+DNS_PER_PAGE = 10
 
 
 def h(val) -> str:
@@ -119,7 +122,6 @@ def load_db():
 
 
 def save_db(db):
-    # Write in-place so Docker single-file bind mounts (./users.json:/app/users.json) never raise EBUSY
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
 
@@ -201,7 +203,7 @@ def del_s(uid):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CLOUDFLARE API
+#  CLOUDFLARE API (sync + non-blocking async wrappers)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def cf_h(uid):
     s = get_s(uid)
@@ -212,12 +214,6 @@ def cf_h(uid):
         "X-Auth-Key": s.get("key", ""),
         "Content-Type": "application/json",
     }
-
-
-def get_account_id(uid=None, zone=None):
-    if zone and zone.get("account", {}).get("id"):
-        return zone["account"]["id"]
-    return ""
 
 
 def cf_get(uid, path, params=None):
@@ -255,6 +251,26 @@ def cf_del(uid, path):
 def cf_patch(uid, path, body):
     r = requests.patch(f"{CF_API}{path}", headers=cf_h(uid), json=body, timeout=15)
     return r.json()
+
+
+async def acf_get(uid, path, params=None):
+    return await asyncio.to_thread(cf_get, uid, path, params)
+
+
+async def acf_post(uid, path, body):
+    return await asyncio.to_thread(cf_post, uid, path, body)
+
+
+async def acf_put(uid, path, body):
+    return await asyncio.to_thread(cf_put, uid, path, body)
+
+
+async def acf_del(uid, path):
+    return await asyncio.to_thread(cf_del, uid, path)
+
+
+async def acf_patch(uid, path, body):
+    return await asyncio.to_thread(cf_patch, uid, path, body)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -386,7 +402,7 @@ async def send_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📋 DNS — View · Add · Edit · Delete records\n"
         "🔒 SSL/TLS — Switch encryption modes\n"
         "📛 Nameservers — View NS records\n"
-        "🌐 Zone Settings — HTTPS, TLS 1.3, HTTP/3, Brotli…\n"
+        "🌐 Zone Settings — HTTPS, Min TLS, TLS 1.3, HTTP/3, Brotli…\n"
         "🔀 Page Rules — View &amp; delete rules\n"
         "👷 Workers — View &amp; manage worker routes\n"
         "📧 Email Routing — Manage forwarding rules\n"
@@ -496,9 +512,9 @@ async def connect_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     wait = await update.effective_chat.send_message("⏳ Verifying your credentials...")
     try:
         if method == "token":
-            cf_get(uid, "/user/tokens/verify")
+            await acf_get(uid, "/user/tokens/verify")
         else:
-            cf_get(uid, "/zones", {"per_page": 1})
+            await acf_get(uid, "/zones", {"per_page": 1})
 
         try:
             track_cf_login(uid, update.effective_user.first_name or "")
@@ -545,7 +561,7 @@ async def cmd_domains(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         zones = []
         page = 1
         while True:
-            d = cf_get(uid, "/zones", {"per_page": 50, "page": page})
+            d = await acf_get(uid, "/zones", {"per_page": 50, "page": page})
             zones.extend(d["result"])
             if page >= d.get("result_info", {}).get("total_pages", 1):
                 break
@@ -591,8 +607,12 @@ async def zone_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_s(uid)
     zone = next((z for z in s.get("zones", []) if z["id"] == zid), None)
     if not zone:
-        await q.message.edit_text("❌ Domain not found. Please refresh.")
-        return
+        try:
+            r = await acf_get(uid, f"/zones/{zid}")
+            zone = r["result"]
+        except Exception:
+            await q.message.edit_text("❌ Domain not found. Please refresh.")
+            return
     set_s(uid, {"cur_zone": zone})
     st = {"active": "🟢 Active", "pending": "🟡 Pending", "moved": "🔴 Moved"}
     ns = "\n".join(f"   <code>{h(n)}</code>" for n in zone.get("name_servers", []))
@@ -643,7 +663,7 @@ async def dns_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         recs = []
         page = 1
         while True:
-            d = cf_get(uid, f"/zones/{zid}/dns_records", {"per_page": 100, "page": page})
+            d = await acf_get(uid, f"/zones/{zid}/dns_records", {"per_page": 100, "page": page})
             recs.extend(d["result"])
             if page >= d.get("result_info", {}).get("total_pages", 1):
                 break
@@ -674,7 +694,7 @@ async def dns_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for t, c in sorted(counts.items()):
             icon = TYPE_ICON.get(t, "⚪")
             text += f"{icon} <b>{h(t)}</b> — {c}\n"
-            row.append(InlineKeyboardButton(f"{icon} {t} ({c})", callback_data=f"ft_{zid}_{t}"))
+            row.append(InlineKeyboardButton(f"{icon} {t} ({c})", callback_data=f"ft_{zid}_{t}_0"))
             if len(row) >= 2:
                 fbtns.append(row)
                 row = []
@@ -689,7 +709,7 @@ async def dns_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  DNS FILTER (by type)
+#  DNS FILTER (by type + pagination)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @need_auth
 async def dns_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -698,18 +718,44 @@ async def dns_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     parts = q.data.split("_")
     zid, rtype = parts[1], parts[2]
+    page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+
     s = get_s(uid)
     zone = s.get("cur_zone", {})
     recs = [r for r in s.get("dns", []) if r["type"] == rtype]
+
+    total = len(recs)
+    total_pages = max(1, math.ceil(total / DNS_PER_PAGE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * DNS_PER_PAGE
+    slice_recs = recs[start:start + DNS_PER_PAGE]
+
     icon = TYPE_ICON.get(rtype, "⚪")
-    text = f"{icon} <b>{h(rtype)} Records — {h(zone.get('name', ''))}</b>\n{len(recs)} record(s)\n\n"
+    page_info = f" • Page {page + 1}/{total_pages}" if total_pages > 1 else ""
+    text = (
+        f"{icon} <b>{h(rtype)} Records — {h(zone.get('name', ''))}</b>\n"
+        f"{total} record(s){page_info}\n\n"
+    )
     btns = []
-    for r in recs[:20]:
-        nm = r["name"].replace(f".{zone.get('name', '')}", "") or "@"
+    zone_name = zone.get("name", "")
+    for r in slice_recs:
+        nm = r["name"].replace(f".{zone_name}", "") if zone_name else r["name"]
+        if nm == zone_name or not nm:
+            nm = "@"
         ct = r["content"][:25] + ("…" if len(r["content"]) > 25 else "")
         px = "☁️" if r.get("proxied") else "🔘"
         text += f"<code>{h(nm)}</code> → <code>{h(ct)}</code> {px}\n"
         btns.append([InlineKeyboardButton(f"✏️ {nm} → {ct}", callback_data=f"ed_{r['id']}")])
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"ft_{zid}_{rtype}_{page - 1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"ft_{zid}_{rtype}_{page + 1}"))
+        btns.append(nav)
+
     btns.append([
         InlineKeyboardButton("🔙 All Records", callback_data=f"dns_{zid}"),
         InlineKeyboardButton("➕ Add", callback_data=f"add_{zid}"),
@@ -745,6 +791,12 @@ async def add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ADD_TYPE
 
 
+async def add_cancel_to_zone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Properly end add_conv when user clicks Cancel and return to zone overview."""
+    await zone_selected(update, ctx)
+    return ConversationHandler.END
+
+
 async def add_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -755,7 +807,7 @@ async def add_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "TXT": "@ or _dmarc", "NS": "sub", "SRV": "_sip._tcp", "CAA": "@",
     }
     await q.message.edit_text(
-        f"➕ <b>{h(t)} Record</b>\n\nSend the <b>name</b>:\n<i>{ph.get(t, '')} — root = @</i>",
+        f"➕ <b>{h(t)} Record</b>\n\nSend the <b>name</b>:\n<i>{ph.get(t, '')} — root = @</i>\n\n<i>/cancel to abort</i>",
         parse_mode="HTML",
     )
     return ADD_NAME
@@ -832,7 +884,7 @@ async def do_add_submit(update, ctx):
 
     wait = await msg.reply_text("⏳ Creating record...")
     try:
-        cf_post(uid, f"/zones/{zid}/dns_records", body)
+        await acf_post(uid, f"/zones/{zid}/dns_records", body)
         px_txt = "☁️ Proxied" if proxied else "🔘 DNS Only"
         await wait.edit_text(
             f"✅ <b>Record created!</b>\n\n"
@@ -896,7 +948,7 @@ async def toggle_proxy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     new_px = not rec.get("proxied", False)
     wait = await q.message.edit_text("⏳ Updating...")
     try:
-        cf_put(
+        await acf_put(
             uid,
             f"/zones/{zid}/dns_records/{rid}",
             {
@@ -930,7 +982,7 @@ async def edit_content_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["edit_rec"] = rec
     ctx.user_data["edit_rid"] = rid
     await q.message.edit_text(
-        f"📝 Current value:\n<code>{h(rec['content'])}</code>\n\nSend the new value:",
+        f"📝 Current value:\n<code>{h(rec['content'])}</code>\n\nSend the new value (or /cancel):",
         parse_mode="HTML",
     )
     return EDIT_VALUE
@@ -956,7 +1008,7 @@ async def edit_content_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         }
         if rec["type"] in ("A", "AAAA", "CNAME"):
             body["proxied"] = rec.get("proxied", False)
-        cf_put(uid, f"/zones/{zid}/dns_records/{rid}", body)
+        await acf_put(uid, f"/zones/{zid}/dns_records/{rid}", body)
         await wait.edit_text(
             f"✅ <b>Updated!</b>\n<code>{h(rec['name'])}</code> → <code>{h(val)}</code>",
             parse_mode="HTML",
@@ -1000,7 +1052,7 @@ async def delete_execute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rid = q.data.replace("dx_", "")
     zid = get_s(uid).get("cur_zone", {}).get("id", "")
     try:
-        cf_del(uid, f"/zones/{zid}/dns_records/{rid}")
+        await acf_del(uid, f"/zones/{zid}/dns_records/{rid}")
         await q.message.edit_text(
             "✅ Record deleted.",
             reply_markup=InlineKeyboardMarkup([[
@@ -1307,7 +1359,7 @@ async def ssl_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         zid, mode = parts[0], parts[1]
         wait = await q.message.edit_text("⏳ Changing SSL mode...")
         try:
-            r = cf_patch(uid, f"/zones/{zid}/settings/ssl", {"value": mode})
+            r = await acf_patch(uid, f"/zones/{zid}/settings/ssl", {"value": mode})
             if r.get("success"):
                 await wait.edit_text(
                     f"✅ SSL changed to <b>{h(mode)}</b>.",
@@ -1337,7 +1389,7 @@ async def ssl_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     wait = await q.message.edit_text("⏳ Fetching SSL settings...")
     try:
-        r = cf_get(uid, f"/zones/{zid}/settings/ssl")
+        r = await acf_get(uid, f"/zones/{zid}/settings/ssl")
     except Exception as e:
         await wait.edit_text(
             f"❌ Error fetching SSL: <code>{h(e)}</code>",
@@ -1383,7 +1435,7 @@ async def ns_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     wait = await q.message.edit_text("⏳ Fetching nameservers...")
     try:
-        r = cf_get(uid, f"/zones/{zid}")
+        r = await acf_get(uid, f"/zones/{zid}")
     except Exception as e:
         await wait.edit_text(
             f"❌ Error: <code>{h(e)}</code>",
@@ -1413,12 +1465,11 @@ async def ns_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  ZONE SETTINGS
+#  ZONE SETTINGS (single fast API call + proper Min TLS picker)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ZONE_TOGGLES = [
     ("always_use_https",          "🔗 Always HTTPS"),
     ("automatic_https_rewrites",  "🔄 Auto HTTPS Rewrites"),
-    ("min_tls_version",           "🔐 Min TLS Version"),
     ("tls_1_3",                   "🔐 TLS 1.3"),
     ("http3",                     "🌐 HTTP/3"),
     ("0rtt",                      "⚡ 0-RTT"),
@@ -1427,6 +1478,7 @@ ZONE_TOGGLES = [
     ("websockets",                "🔌 WebSockets"),
     ("opportunistic_encryption",  "🔒 Opp. Encryption"),
 ]
+TLS_VERSIONS = ["1.0", "1.1", "1.2", "1.3"]
 
 
 @need_auth
@@ -1438,6 +1490,62 @@ async def zone_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_s(uid)
     zone = s.get("cur_zone", {})
 
+    # Min TLS Version picker: tls_{zid} or tlsset_{zid}_{ver}
+    if d.startswith("tlsset_"):
+        parts = d.replace("tlsset_", "").rsplit("_", 1)
+        zid, ver = parts[0], parts[1]
+        wait = await q.message.edit_text(f"⏳ Setting Min TLS Version to {ver}…")
+        try:
+            r = await acf_patch(uid, f"/zones/{zid}/settings/min_tls_version", {"value": ver})
+            if r.get("success"):
+                zs_cache = s.get("zs_results", {})
+                zs_cache["min_tls_version"] = ver
+                set_s(uid, {"zs_results": zs_cache})
+                await wait.edit_text(
+                    f"✅ <b>Min TLS Version</b> → <b>TLS {h(ver)}</b>",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back to Settings", callback_data=f"zs_{zid}")
+                    ]]),
+                )
+            else:
+                err = (r.get("errors") or [{}])[0].get("message", "Unknown error")
+                await wait.edit_text(
+                    f"❌ <code>{h(err)}</code>",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back", callback_data=f"zs_{zid}")
+                    ]]),
+                )
+        except Exception as e:
+            await wait.edit_text(
+                f"❌ <code>{h(e)}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Back", callback_data=f"zs_{zid}")
+                ]]),
+            )
+        return
+
+    if d.startswith("tls_"):
+        zid = d.replace("tls_", "")
+        cur_tls = s.get("zs_results", {}).get("min_tls_version", "1.2")
+        text = (
+            f"🔐 <b>Min TLS Version — {h(zone.get('name', ''))}</b>\n{DIV}\n\n"
+            f"Current: <b>TLS {h(cur_tls)}</b>\n\n"
+            "Select minimum TLS version (<b>1.2</b> recommended):"
+        )
+        btns = []
+        for ver in TLS_VERSIONS:
+            if ver == cur_tls:
+                btns.append([InlineKeyboardButton(f"✅ TLS {ver}", callback_data="noop")])
+            else:
+                btns.append([InlineKeyboardButton(f"TLS {ver}", callback_data=f"tlsset_{zid}_{ver}")])
+        btns.append([InlineKeyboardButton("🔙 Back to Settings", callback_data=f"zs_{zid}")])
+        await q.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
+        return
+
+    # Binary on/off toggle: zst_{zid}_{idx}
     if d.startswith("zst_"):
         parts = d.replace("zst_", "").rsplit("_", 1)
         zid, idx = parts[0], int(parts[1])
@@ -1446,21 +1554,30 @@ async def zone_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cur_val = zs_cache.get(key, "off")
         new_val = "off" if cur_val == "on" else "on"
         wait = await q.message.edit_text(f"⏳ Toggling {label}…")
-        r = cf_patch(uid, f"/zones/{zid}/settings/{key}", {"value": new_val})
-        if r.get("success"):
-            zs_cache[key] = new_val
-            set_s(uid, {"zs_results": zs_cache})
+        try:
+            r = await acf_patch(uid, f"/zones/{zid}/settings/{key}", {"value": new_val})
+            if r.get("success"):
+                zs_cache[key] = new_val
+                set_s(uid, {"zs_results": zs_cache})
+                await wait.edit_text(
+                    f"✅ <b>{h(label)}</b> → <b>{h(new_val)}</b>",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back to Settings", callback_data=f"zs_{zid}")
+                    ]]),
+                )
+            else:
+                err = (r.get("errors") or [{}])[0].get("message", "Unknown error")
+                await wait.edit_text(
+                    f"❌ <b>{h(label)}</b>\n<code>{h(err)}</code>",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Back", callback_data=f"zs_{zid}")
+                    ]]),
+                )
+        except Exception as e:
             await wait.edit_text(
-                f"✅ <b>{h(label)}</b> → <b>{h(new_val)}</b>",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔙 Back to Settings", callback_data=f"zs_{zid}")
-                ]]),
-            )
-        else:
-            err = (r.get("errors") or [{}])[0].get("message", "Unknown error")
-            await wait.edit_text(
-                f"❌ <b>{h(label)}</b>\n<code>{h(err)}</code>",
+                f"❌ <code>{h(e)}</code>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔙 Back", callback_data=f"zs_{zid}")
@@ -1468,21 +1585,19 @@ async def zone_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # View all settings in ONE API request
     zid = d.replace("zs_", "")
     wait = await q.message.edit_text("⏳ Fetching zone settings…")
     try:
-        results = {}
-        for key, _ in ZONE_TOGGLES:
-            try:
-                r = cf_get(uid, f"/zones/{zid}/settings/{key}")
-                results[key] = r["result"]["value"]
-            except Exception:
-                results[key] = "—"
-
+        r = await acf_get(uid, f"/zones/{zid}/settings")
+        results = {item["id"]: item.get("value", "—") for item in r.get("result", [])}
         set_s(uid, {"zs_results": results})
 
+        min_tls = results.get("min_tls_version", "—")
         text = f"🌐 <b>Zone Settings — {h(zone.get('name', ''))}</b>\n{DIV}\n\n"
-        btns = []
+        text += f"🔐 Min TLS Version: <b>TLS {h(min_tls)}</b>\n"
+
+        btns = [[InlineKeyboardButton(f"🔐 Min TLS Version: {min_tls}", callback_data=f"tls_{zid}")]]
         for idx, (key, label) in enumerate(ZONE_TOGGLES):
             val = results.get(key, "—")
             if val == "on":
@@ -1497,7 +1612,13 @@ async def zone_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         btns.append([InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")])
         await wait.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(btns))
     except Exception as e:
-        await wait.edit_text(f"❌ Error: <code>{h(e)}</code>", parse_mode="HTML")
+        await wait.edit_text(
+            f"❌ Error: <code>{h(e)}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")
+            ]]),
+        )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1514,7 +1635,7 @@ async def page_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     wait = await q.message.edit_text("⏳ Fetching page rules...")
     try:
-        d = cf_get(uid, f"/zones/{zid}/pagerules", {"status": "active", "per_page": 50})
+        d = await acf_get(uid, f"/zones/{zid}/pagerules", {"status": "active", "per_page": 50})
         rules = d["result"]
         set_s(uid, {"pagerules": rules})
 
@@ -1558,7 +1679,7 @@ async def workers_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     wait = await q.message.edit_text("⏳ Fetching workers...")
     try:
-        d = cf_get(uid, f"/zones/{zid}/workers/routes")
+        d = await acf_get(uid, f"/zones/{zid}/workers/routes")
         routes = d["result"]
 
         if not routes:
@@ -1573,7 +1694,7 @@ async def workers_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         text = f"👷 <b>Workers — {h(zone.get('name', ''))}</b>\n{len(routes)} route(s)\n\n"
         btns = []
-        for route in routes[:10]:
+        for route in routes[:15]:
             pattern = route.get("pattern", "?")
             script = route.get("script", "—")
             text += f"<code>{h(pattern[:35])}</code> → <b>{h(script)}</b>\n"
@@ -1600,7 +1721,7 @@ async def email_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     wait = await q.message.edit_text("⏳ Fetching email routing…")
     try:
-        d = cf_get(uid, f"/zones/{zid}/email/routing")
+        d = await acf_get(uid, f"/zones/{zid}/email/routing")
         result = d["result"]
         enabled = result.get("enabled", False)
         status_icon = "✅" if enabled else "❌"
@@ -1608,7 +1729,7 @@ async def email_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         rules = []
         try:
-            rules_d = cf_get(uid, f"/zones/{zid}/email/routing/rules")
+            rules_d = await acf_get(uid, f"/zones/{zid}/email/routing/rules")
             rules = rules_d["result"]
         except Exception:
             pass
@@ -1753,7 +1874,7 @@ async def email_add_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "matchers": [{"field": "to", "type": "literal", "value": from_addr}],
             "actions": [{"type": "forward", "value": [to_addr]}],
         }
-        cf_post(uid, f"/zones/{zid}/email/routing/rules", body)
+        await acf_post(uid, f"/zones/{zid}/email/routing/rules", body)
         await wait.edit_text(
             f"╭─❀ <b>RULE CREATED</b> ❀─╮\n"
             f"{DIV}\n\n"
@@ -1811,7 +1932,7 @@ async def email_toggle_rule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "matchers": rule.get("matchers", []),
             "actions": rule.get("actions", []),
         }
-        cf_put(uid, f"/zones/{zid}/email/routing/rules/{tag}", body)
+        await acf_put(uid, f"/zones/{zid}/email/routing/rules/{tag}", body)
         state = "✅ Enabled" if new_enabled else "⏸ Disabled"
         await wait.edit_text(
             f"Rule {state}.",
@@ -1882,7 +2003,7 @@ async def email_delete_execute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     wait = await q.message.edit_text("⏳ Deleting rule…")
     try:
-        cf_del(uid, f"/zones/{zid}/email/routing/rules/{tag}")
+        await acf_del(uid, f"/zones/{zid}/email/routing/rules/{tag}")
         await wait.edit_text(
             "✅ <b>Rule deleted.</b>",
             parse_mode="HTML",
@@ -1895,7 +2016,7 @@ async def email_delete_execute(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  ANALYTICS
+#  ANALYTICS (Cloudflare GraphQL Analytics API — last 24h)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _fmt_bytes(b):
     if b >= 1_073_741_824:
@@ -1916,43 +2037,94 @@ def _fmt_num(n):
 
 
 def _cf_analytics_zone(uid, zid):
+    """Fetch 24h zone analytics via Cloudflare's GraphQL Analytics API."""
     now = datetime.now(timezone.utc)
     since = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
     until = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    query = f"""
+    {{
+      viewer {{
+        zones(filter: {{ zoneTag: "{zid}" }}) {{
+          httpRequests1hGroups(
+            limit: 48,
+            filter: {{ datetime_geq: "{since}", datetime_leq: "{until}" }}
+          ) {{
+            sum {{
+              requests
+              cachedRequests
+              bytes
+              cachedBytes
+              threats
+              pageViews
+              countryMap {{
+                clientCountryName
+                requests
+              }}
+              responseStatusMap {{
+                edgeResponseStatus
+                requests
+              }}
+            }}
+            uniq {{
+              uniques
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+
     try:
-        d = cf_get(
-            uid,
-            f"/zones/{zid}/analytics/dashboard",
-            {"since": since, "until": until, "continuous": "false"},
+        r = requests.post(
+            CF_GRAPHQL,
+            headers=cf_h(uid),
+            json={"query": query},
+            timeout=20,
         )
-        totals = d.get("result", {}).get("totals", {})
-        reqs = totals.get("requests", {})
-        bandwidth = totals.get("bandwidth", {})
-        threats = totals.get("threats", {})
-        pageviews = totals.get("pageviews", {})
-        uniq = totals.get("uniques", {})
+        d = r.json()
+        if d.get("errors"):
+            err_msg = ", ".join(e.get("message", "GraphQL error") for e in d["errors"])
+            return {"ok": False, "error": err_msg}
 
-        total_req = reqs.get("all", 0)
-        cached_req = reqs.get("cached", 0)
-        uncached_req = reqs.get("uncached", 0)
-        cache_pct = round((cached_req / total_req * 100) if total_req > 0 else 0, 1)
+        zones_data = d.get("data", {}).get("viewer", {}).get("zones", [])
+        if not zones_data:
+            return {"ok": False, "error": "No analytics data returned for this zone."}
 
-        total_bw = bandwidth.get("all", 0)
-        cached_bw = bandwidth.get("cached", 0)
-        bw_cache_pct = round((cached_bw / total_bw * 100) if total_bw > 0 else 0, 1)
+        groups = zones_data[0].get("httpRequests1hGroups", [])
 
-        threat_total = threats.get("all", 0)
-        pv_total = pageviews.get("all", 0)
-        visitors = uniq.get("all", 0)
-
+        total_req = 0
+        cached_req = 0
+        total_bw = 0
+        cached_bw = 0
+        threat_total = 0
+        pv_total = 0
+        visitors = 0
         by_country = {}
-        for bucket in d.get("result", {}).get("timeseries", []):
-            for c, v in bucket.get("requests", {}).get("country", {}).items():
-                by_country[c] = by_country.get(c, 0) + v
-        top_countries = sorted(by_country.items(), key=lambda x: x[1], reverse=True)[:5]
+        status_map = {}
 
-        status_map = reqs.get("http_status", {})
+        for g in groups:
+            sm = g.get("sum", {})
+            total_req += sm.get("requests", 0)
+            cached_req += sm.get("cachedRequests", 0)
+            total_bw += sm.get("bytes", 0)
+            cached_bw += sm.get("cachedBytes", 0)
+            threat_total += sm.get("threats", 0)
+            pv_total += sm.get("pageViews", 0)
+            visitors += g.get("uniq", {}).get("uniques", 0)
+
+            for c in sm.get("countryMap", []):
+                code = c.get("clientCountryName", "??")
+                by_country[code] = by_country.get(code, 0) + c.get("requests", 0)
+
+            for st in sm.get("responseStatusMap", []):
+                code = str(st.get("edgeResponseStatus", "?"))
+                status_map[code] = status_map.get(code, 0) + st.get("requests", 0)
+
+        uncached_req = max(0, total_req - cached_req)
+        cache_pct = round((cached_req / total_req * 100) if total_req > 0 else 0, 1)
+        bw_cache_pct = round((cached_bw / total_bw * 100) if total_bw > 0 else 0, 1)
+        top_countries = sorted(by_country.items(), key=lambda x: x[1], reverse=True)[:5]
 
         return {
             "ok": True,
@@ -1981,7 +2153,9 @@ async def zone_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     zid = q.data.replace("analytics_", "")
     s = get_s(uid)
-    zone = s.get("cur_zone", {})
+    zone = next((z for z in s.get("zones", []) if z["id"] == zid), s.get("cur_zone", {}))
+    if zone:
+        set_s(uid, {"cur_zone": zone})
     zone_name = zone.get("name", zid)
 
     wait = await q.message.edit_text(
@@ -1989,16 +2163,14 @@ async def zone_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
 
-    loop = asyncio.get_event_loop()
-    data = await loop.run_in_executor(None, _cf_analytics_zone, uid, zid)
+    data = await asyncio.to_thread(_cf_analytics_zone, uid, zid)
 
     if not data["ok"]:
         await wait.edit_text(
             f"╭─❀ <b>ANALYTICS</b> ❀─╮\n{DIV}\n\n"
             f"❌ <b>Could not fetch analytics.</b>\n\n"
             f"<code>{h(data['error'])}</code>\n\n"
-            "<i>Note: Analytics require a zone with at least some traffic, "
-            "and your API token needs Zone · Analytics · Read permission.</i>",
+            "<i>Note: Your API token needs <code>Zone · Analytics · Read</code> permission.</i>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔙 Back", callback_data=f"zone_{zid}")
@@ -2028,7 +2200,7 @@ async def zone_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🌐 <b>Traffic Overview</b>\n"
         f"  📥 Requests: <b>{_fmt_num(data['total_req'])}</b>\n"
         f"  👁 Pageviews: <b>{_fmt_num(data['pageviews'])}</b>\n"
-        f"  👤 Unique visitors: <b>{_fmt_num(data['visitors'])}</b>\n\n"
+        f"  👤 Unique visitors (hourly sum): <b>{_fmt_num(data['visitors'])}</b>\n\n"
         f"⚡ <b>Cache Performance</b>\n"
         f"  ✅ Cached: <b>{_fmt_num(data['cached_req'])}</b> ({data['cache_pct']}%)\n"
         f"  🔄 Uncached: <b>{_fmt_num(data['uncached_req'])}</b>\n\n"
@@ -2067,7 +2239,7 @@ async def global_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             all_zones = []
             page = 1
             while True:
-                d = cf_get(uid, "/zones", {"per_page": 50, "page": page})
+                d = await acf_get(uid, "/zones", {"per_page": 50, "page": page})
                 all_zones.extend(d["result"])
                 if page >= d.get("result_info", {}).get("total_pages", 1):
                     break
@@ -2173,7 +2345,6 @@ def _ssh_connect(host, port, user, auth_method, password, key_data):
 
 
 def _ssh_deploy(host, port, user, auth_method, password, key_data, bot_token, webapp_url):
-    """Runs entirely in a thread executor — safe blocking SSH call."""
     client = None
     try:
         client = _ssh_connect(host, port, user, auth_method, password, key_data)
@@ -2421,8 +2592,8 @@ async def deploy_webapp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
 
-    result = await asyncio.get_event_loop().run_in_executor(
-        None, _ssh_deploy, host, port, user, auth_method, password, key_data, bot_token, webapp
+    result = await asyncio.to_thread(
+        _ssh_deploy, host, port, user, auth_method, password, key_data, bot_token, webapp
     )
 
     if result["success"]:
@@ -2472,7 +2643,6 @@ async def deploy_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @need_auth
 async def page_rule_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Inform user to add page rules via Cloudflare dashboard (API deprecated)."""
     q = update.callback_query
     await q.answer()
     zid = q.data.replace("pradd_", "")
@@ -2494,7 +2664,6 @@ async def page_rule_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @need_auth
 async def page_rule_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show detail + delete option for a page rule."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
@@ -2538,7 +2707,6 @@ async def page_rule_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @need_auth
 async def page_rule_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Delete a page rule."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
@@ -2547,7 +2715,7 @@ async def page_rule_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     zid = s.get("cur_zone", {}).get("id", "")
     wait = await q.message.edit_text("⏳ Deleting page rule…")
     try:
-        cf_del(uid, f"/zones/{zid}/pagerules/{rid}")
+        await acf_del(uid, f"/zones/{zid}/pagerules/{rid}")
         await wait.edit_text(
             "✅ <b>Page rule deleted.</b>",
             parse_mode="HTML",
@@ -2570,7 +2738,6 @@ async def page_rule_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @need_auth
 async def worker_route_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Delete a worker route."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
@@ -2579,7 +2746,7 @@ async def worker_route_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     zid = s.get("cur_zone", {}).get("id", "")
     wait = await q.message.edit_text("⏳ Deleting worker route…")
     try:
-        cf_del(uid, f"/zones/{zid}/workers/routes/{rid}")
+        await acf_del(uid, f"/zones/{zid}/workers/routes/{rid}")
         await wait.edit_text(
             "✅ <b>Worker route deleted.</b>",
             parse_mode="HTML",
@@ -2599,7 +2766,6 @@ async def worker_route_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @need_auth
 async def worker_route_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show worker route detail with delete option."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
@@ -2608,7 +2774,7 @@ async def worker_route_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     zid = s.get("cur_zone", {}).get("id", "")
     wait = await q.message.edit_text("⏳ Fetching route details…")
     try:
-        d = cf_get(uid, f"/zones/{zid}/workers/routes/{rid}")
+        d = await acf_get(uid, f"/zones/{zid}/workers/routes/{rid}")
         route = d["result"]
         pattern = route.get("pattern", "?")
         script = route.get("script", "—") or "— (no script)"
@@ -2640,7 +2806,6 @@ async def worker_route_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @need_auth
 async def email_toggle_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Enable or disable email routing entirely for a zone."""
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
@@ -2650,9 +2815,9 @@ async def email_toggle_routing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     wait = await q.message.edit_text("⏳ Updating email routing…")
     try:
         if enable:
-            cf_post(uid, f"/zones/{zid}/email/routing/enable", {})
+            await acf_post(uid, f"/zones/{zid}/email/routing/enable", {})
         else:
-            cf_post(uid, f"/zones/{zid}/email/routing/disable", {})
+            await acf_post(uid, f"/zones/{zid}/email/routing/disable", {})
         state = "✅ Enabled" if enable else "❌ Disabled"
         await wait.edit_text(
             f"Email Routing {state}.",
@@ -2752,6 +2917,7 @@ def main():
             MessageHandler(filters.COMMAND, connect_cancel_msg),
         ],
         allow_reentry=True,
+        conversation_timeout=600,
     )
 
     add_conv = ConversationHandler(
@@ -2763,10 +2929,12 @@ def main():
             ADD_PROXY: [CallbackQueryHandler(add_proxy, pattern="^px_")],
         },
         fallbacks=[
+            CallbackQueryHandler(add_cancel_to_zone, pattern="^zone_"),
             CommandHandler("start", cancel_and_start),
             CommandHandler("cancel", connect_cancel_msg),
         ],
         allow_reentry=True,
+        conversation_timeout=600,
     )
 
     edit_conv = ConversationHandler(
@@ -2779,6 +2947,7 @@ def main():
             CommandHandler("cancel", connect_cancel_msg),
         ],
         allow_reentry=True,
+        conversation_timeout=600,
     )
 
     broadcast_conv = ConversationHandler(
@@ -2791,6 +2960,7 @@ def main():
             CommandHandler("cancel", broadcast_cancel),
         ],
         allow_reentry=True,
+        conversation_timeout=600,
     )
 
     email_add_conv = ConversationHandler(
@@ -2804,6 +2974,7 @@ def main():
             CommandHandler("cancel", connect_cancel_msg),
         ],
         allow_reentry=True,
+        conversation_timeout=600,
     )
 
     app.add_handler(deploy_conv)
@@ -2841,6 +3012,8 @@ def main():
     app.add_handler(CallbackQueryHandler(ns_info, pattern="^ns_"))
     app.add_handler(CallbackQueryHandler(zone_settings, pattern="^zs_"))
     app.add_handler(CallbackQueryHandler(zone_settings, pattern="^zst_"))
+    app.add_handler(CallbackQueryHandler(zone_settings, pattern="^tls_"))
+    app.add_handler(CallbackQueryHandler(zone_settings, pattern="^tlsset_"))
     app.add_handler(CallbackQueryHandler(page_rules, pattern="^pr_"))
     app.add_handler(CallbackQueryHandler(workers_list, pattern="^wk_"))
     app.add_handler(CallbackQueryHandler(email_routing, pattern="^em_"))
