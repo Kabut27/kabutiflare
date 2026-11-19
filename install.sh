@@ -8,65 +8,122 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 echo -e "${CYAN}"
-echo "  ╔═══════════════════════════════════════╗"
-echo "  ║         KabutiFlare Installer         ║"
-echo "  ║   Cloudflare Manager for Telegram     ║"
-echo "  ╚═══════════════════════════════════════╝"
+echo "  ╔═══════════════════════════════════════════╗"
+echo "  ║           KabutiFlare Installer           ║"
+echo "  ║  Cloudflare Manager + Auto-Failover Bot   ║"
+echo "  ╚═══════════════════════════════════════════╝"
 echo -e "${NC}"
 
 REPO="https://raw.githubusercontent.com/Kabut27/kabutiflare/main"
 DIR="/opt/kabutiflare"
 
-# ── Install method ───────────────────────────────────────────────────────────
+# Soma input hata script ikikimbizwa kupitia: curl -fsSL ... | bash
+ask() {
+  local prompt="$1"
+  local var_name="$2"
+  local default_val="${3:-}"
+  local input=""
+  if [ -r /dev/tty ]; then
+    read -r -p "$prompt" input < /dev/tty
+  else
+    read -r -p "$prompt" input
+  fi
+  if [ -z "$input" ]; then
+    eval "$var_name=\"\$default_val\""
+  else
+    eval "$var_name=\"\$input\""
+  fi
+}
+
+# Pakia .env ya zamani kama ipo (kwa ajili ya update bila kupoteza config)
+OLD_BOT_TOKEN=""
+OLD_CF_TOKEN=""
+OLD_WEBAPP_URL=""
+OLD_ADMIN_ID="474008580"
+if [ -f "$DIR/.env" ]; then
+  echo -e "${YELLOW}ℹ️  Existing .env detected in $DIR — press Enter to keep saved values.${NC}\n"
+  OLD_BOT_TOKEN=$(grep -E '^BOT_TOKEN=' "$DIR/.env" | cut -d'=' -f2- | tr -d '"' || true)
+  OLD_CF_TOKEN=$(grep -E '^CF_API_TOKEN=' "$DIR/.env" | cut -d'=' -f2- | tr -d '"' || true)
+  OLD_WEBAPP_URL=$(grep -E '^WEBAPP_URL=' "$DIR/.env" | cut -d'=' -f2- | tr -d '"' || true)
+  _aid=$(grep -E '^ADMIN_ID=' "$DIR/.env" | cut -d'=' -f2- | tr -d '"' || true)
+  [ -n "$_aid" ] && OLD_ADMIN_ID="$_aid"
+fi
+
+# ── 1. Install Method ─────────────────────────────────────────────────────────
 echo -e "${YELLOW}Install method:${NC}"
 echo "  1) 🐳 Docker (recommended)"
 echo "  2) 📦 Systemd (without Docker)"
-read -p "Choose [1/2]: " METHOD
-METHOD=${METHOD:-1}
+ask "Choose [1/2] (default 1): " METHOD "1"
 
-# ── Bot Token ─────────────────────────────────────────────────────────────────
+# ── 2. Bot Token (Required) ───────────────────────────────────────────────────
 echo ""
-read -p "🤖 Telegram Bot Token: " BOT_TOKEN
+if [ -n "$OLD_BOT_TOKEN" ]; then
+  ask "🤖 Telegram Bot Token [Enter to keep existing]: " BOT_TOKEN "$OLD_BOT_TOKEN"
+else
+  ask "🤖 Telegram Bot Token: " BOT_TOKEN ""
+fi
 if [ -z "$BOT_TOKEN" ]; then
-  echo -e "${RED}❌ Bot token is required${NC}"
+  echo -e "${RED}❌ Bot token is required.${NC}"
   exit 1
 fi
 
-# ── Webapp URL (optional) ──────────────────────────────────────────────────────
+# ── 3. Cloudflare API Token (Optional — recommended for 24/7 Auto-Failover) ───
 echo ""
-echo -e "${YELLOW}🌐 Webapp URL (optional):${NC}"
-echo "   Press Enter to skip mini app"
-read -p "URL: " WEBAPP_URL
-WEBAPP_URL=${WEBAPP_URL:-""}
+echo -e "${YELLOW}☁️  Cloudflare API Token (optional):${NC}"
+echo "   • Recommended if you want 24/7 Auto-Failover & Admin auto-login."
+echo "   • Press Enter to skip (you can connect later inside Telegram)."
+if [ -n "$OLD_CF_TOKEN" ]; then
+  ask "CF API Token [Enter to keep existing]: " CF_API_TOKEN "$OLD_CF_TOKEN"
+else
+  ask "CF API Token: " CF_API_TOKEN ""
+fi
+
+# ── Zima cf-failover-telegram ya zamani kuzuia 409 Conflict ───────────────────
+if systemctl list-unit-files 2>/dev/null | grep -q '^cf-failover-telegram\.service'; then
+  echo -e "\n${YELLOW}⚠️  Stopping old cf-failover-telegram.service to prevent Telegram 409 Conflict...${NC}"
+  systemctl stop cf-failover-telegram.service 2>/dev/null || true
+  systemctl disable cf-failover-telegram.service 2>/dev/null || true
+fi
 
 # ── Download files ────────────────────────────────────────────────────────────
-echo -e "\n${CYAN}📥 Downloading files...${NC}"
+echo -e "\n${CYAN}📥 Downloading KabutiFlare files...${NC}"
 mkdir -p "$DIR"
 cd "$DIR"
 
 curl -fsSL "$REPO/bot.py"             -o bot.py
 curl -fsSL "$REPO/requirements.txt"   -o requirements.txt
-curl -fsSL "$REPO/worker.js"          -o worker.js
 curl -fsSL "$REPO/Dockerfile"         -o Dockerfile
 curl -fsSL "$REPO/docker-compose.yml" -o docker-compose.yml
 
-if [ -n "$WEBAPP_URL" ]; then
-  curl -fsSL "$REPO/webapp.html" -o webapp.html
-fi
-
-# ── Create .env ───────────────────────────────────────────────────────────────
+# ── Create Pre-configured .env ────────────────────────────────────────────────
 cat > .env << EOF
-BOT_TOKEN=$BOT_TOKEN
-WEBAPP_URL=$WEBAPP_URL
+# Core Telegram & Admin
+BOT_TOKEN=${BOT_TOKEN}
+ADMIN_ID=${OLD_ADMIN_ID}
+PRIVATE_MODE=false
+WEBAPP_URL=${OLD_WEBAPP_URL}
+
+# Cloudflare Auto-Login & 24/7 Failover (Admin)
+CF_API_TOKEN=${CF_API_TOKEN}
+
+# Failover Engine Defaults (can also be edited inside Telegram)
+FAILOVER_CHECK_METHOD=tcp
+FAILOVER_CHECK_PORT=443
+FAILOVER_CHECK_TIMEOUT=5
+FAILOVER_INTERVAL=30
+FAILOVER_DNS_TTL=60
+FAILOVER_HEALTH_PATH=/
 EOF
+chmod 600 .env
 
 # ── Init users.json ───────────────────────────────────────────────────────────
-[ -f users.json ] || echo '{"users":{},"cf_logins":{}}' > users.json
+if [ ! -f users.json ]; then
+  echo '{"users":{},"cf_logins":{},"banned_users":[],"failover":{}}' > users.json
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 if [ "$METHOD" = "1" ]; then
-# ── Docker ────────────────────────────────────────────────────────────────────
-  echo -e "${CYAN}🐳 Docker install...${NC}"
+  echo -e "\n${CYAN}🐳 Installing with Docker...${NC}"
 
   if ! command -v docker &>/dev/null; then
     echo -e "${YELLOW}📦 Installing Docker...${NC}"
@@ -86,21 +143,21 @@ if [ "$METHOD" = "1" ]; then
   echo -e "🔧 Logs      : ${CYAN}docker compose -f $DIR/docker-compose.yml logs -f${NC}"
   echo -e "🔄 Restart   : ${CYAN}docker compose -f $DIR/docker-compose.yml restart${NC}"
   echo -e "🛑 Stop      : ${CYAN}docker compose -f $DIR/docker-compose.yml down${NC}"
-  echo -e "⬆️  Update    : ${CYAN}cd $DIR && git pull && docker compose down && docker compose up -d --build${NC}"
+  echo -e "⬆️  Update    : ${CYAN}curl -fsSL $REPO/install.sh | bash${NC}"
 
 else
-# ── Systemd ───────────────────────────────────────────────────────────────────
-  echo -e "${CYAN}📦 Systemd install...${NC}"
+  echo -e "\n${CYAN}📦 Installing with Systemd...${NC}"
 
   apt-get update -qq
-  apt-get install -y -qq python3 python3-pip 2>/dev/null
+  apt-get install -y -qq python3 python3-pip >/dev/null 2>&1
 
   pip3 install -r requirements.txt --break-system-packages 2>/dev/null || pip3 install -r requirements.txt
 
   cat > /etc/systemd/system/kabutiflare.service << EOF
 [Unit]
-Description=KabutiFlare Telegram Bot
-After=network.target
+Description=KabutiFlare Telegram Bot (Cloudflare + Auto-Failover)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -116,18 +173,18 @@ EOF
 
   systemctl daemon-reload
   systemctl enable kabutiflare
-  systemctl start kabutiflare
+  systemctl restart kabutiflare
 
   echo -e "\n${GREEN}✅ KabutiFlare deployed with Systemd!${NC}"
   echo -e "📁 Directory : ${CYAN}$DIR${NC}"
   echo -e "🔧 Logs      : ${CYAN}journalctl -u kabutiflare -f${NC}"
   echo -e "🔄 Restart   : ${CYAN}systemctl restart kabutiflare${NC}"
   echo -e "🛑 Stop      : ${CYAN}systemctl stop kabutiflare${NC}"
+  echo -e "⬆️  Update    : ${CYAN}curl -fsSL $REPO/install.sh | bash${NC}"
 fi
 
 echo ""
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${GREEN}  KabutiFlare is running! 🚀${NC}"
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "Built with ❤️  by ${CYAN}Kabut27${NC}"
